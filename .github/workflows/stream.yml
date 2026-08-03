@@ -3,10 +3,15 @@ on:
   workflow_dispatch:
   schedule:
    - cron: "0 */5 * * *"
+
+concurrency:
+  group: stream-job
+  cancel-in-progress: true
+
 jobs:
   stream:
     runs-on: ubuntu-latest
-    timeout-minutes: 360
+    timeout-minutes: 290
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
