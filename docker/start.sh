@@ -42,6 +42,20 @@ HEADLINE_FONTSIZE=21
 HEADLINE_LINE_SPACING=9
 HEADLINE_LINE_H=$((HEADLINE_FONTSIZE + HEADLINE_LINE_SPACING))
 
+# Don't show "N watching now" until the live viewer count reaches this
+# many — a very low number (e.g. "5 watching") reads worse to a new
+# visitor than showing nothing at all. Raise/lower to taste.
+VIEWER_MIN_TO_SHOW=10
+
+# Approximate center + radius (in 1280x720 output coordinates) of the
+# subscribe icon baked into overlay.png, used to draw a pulsing gold
+# ring around it every few seconds so it catches the eye. Adjust these
+# three numbers to match the icon's actual position in your overlay.png
+# — the defaults below are an estimate for the bottom-right corner.
+SUB_ICON_X=1249
+SUB_ICON_Y=677
+SUB_ICON_R=20
+
 #############################################
 # Up-next bumper (shown between videos)
 #############################################
@@ -166,8 +180,13 @@ if [ "$SHOW_STATS" = true ]; then
             if [ -n "$LIVE_VIDEO_ID" ]; then
                 VRESP=$(curl -s "https://www.googleapis.com/youtube/v3/videos?part=liveStreamingDetails&id=${LIVE_VIDEO_ID}&key=${YOUTUBE_API_KEY}" || true)
                 VIEWERS=$(echo "$VRESP" | grep -o '"concurrentViewers": *"[0-9]*"' | grep -o '[0-9]*')
-                if [ -n "$VIEWERS" ]; then
+                if [ -n "$VIEWERS" ] && [ "$VIEWERS" -ge "$VIEWER_MIN_TO_SHOW" ]; then
                     printf '%s watching now' "$VIEWERS" > "$ASSET_DIR/viewers.txt.tmp"
+                    mv -f "$ASSET_DIR/viewers.txt.tmp" "$ASSET_DIR/viewers.txt"
+                elif [ -n "$VIEWERS" ]; then
+                    # Below the display threshold — keep the panel blank
+                    # rather than showing a small/discouraging number.
+                    printf ' ' > "$ASSET_DIR/viewers.txt.tmp"
                     mv -f "$ASSET_DIR/viewers.txt.tmp" "$ASSET_DIR/viewers.txt"
                 else
                     # Broadcast ended or hasn't registered yet — clear and re-search.
@@ -364,6 +383,9 @@ build_labels_chain() {
     local V_OFFSET=70
     local H_OFFSET=40
     local ACCENT_W=4
+    local BOX_GAP=10          # minimum clear space required between two label boxes
+    local placed_x=() placed_y=()  # top-left corners of boxes already placed this video
+    local k collision tries
 
     # Split the pre-rendered marker image (input [2:v]) into one copy per
     # label so each can be overlaid independently at its own coordinate.
@@ -386,6 +408,38 @@ build_labels_chain() {
             box_x=$((x - H_OFFSET - BOX_W))
         fi
         [ "$box_x" -lt 0 ] && box_x=10
+
+        # Collision avoidance: if this box overlaps (within BOX_GAP of)
+        # any box already placed for an earlier label on this video,
+        # push it downward in BOX_H+BOX_GAP steps until it's clear, so
+        # two nearby coordinate labels never end up crowding each other
+        # like "Glowing gas knot" / "Dust cloud region" did before.
+        tries=0
+        while :; do
+            collision=false
+            for ((k = 0; k < ${#placed_x[@]}; k++)); do
+                local px="${placed_x[$k]}" py="${placed_y[$k]}"
+                if [ $((box_x)) -lt $((px + BOX_W + BOX_GAP)) ] && \
+                   [ $((box_x + BOX_W + BOX_GAP)) -gt $((px)) ] && \
+                   [ $((box_y)) -lt $((py + BOX_H + BOX_GAP)) ] && \
+                   [ $((box_y + BOX_H + BOX_GAP)) -gt $((py)) ]; then
+                    collision=true
+                    break
+                fi
+            done
+            [ "$collision" = false ] && break
+            box_y=$((box_y + BOX_H + BOX_GAP))
+            # Ran off the bottom of the frame — wrap back to the top and
+            # keep nudging; after a handful of tries just accept overlap
+            # rather than loop forever (extremely dense label sets only).
+            if [ $((box_y + BOX_H)) -gt 700 ]; then
+                box_y=20
+            fi
+            tries=$((tries + 1))
+            [ "$tries" -gt 12 ] && break
+        done
+        placed_x+=("$box_x")
+        placed_y+=("$box_y")
 
         local seg_y_top seg_y_bot
         if [ "$box_y" -gt "$y" ]; then
@@ -518,7 +572,7 @@ prepare_video_content() {
     echo "Longest headline wraps to $MAX_HEADLINE_LINES line(s)."
 
     HEADLINE_Y=230
-    PROGRESS_Y=$((HEADLINE_Y + MAX_HEADLINE_LINES * HEADLINE_LINE_H + 12))
+    PROGRESS_Y=$((HEADLINE_Y + MAX_HEADLINE_LINES * HEADLINE_LINE_H + 26))
     DOTS_Y=$((PROGRESS_Y + 20))
     FACT_DIVIDER_Y=$((DOTS_Y + 40))
     FACT_LABEL_Y=$((FACT_DIVIDER_Y + 14))
@@ -584,7 +638,8 @@ prepare_video_content() {
         prev="$nxt"
     done
 
-    CHAIN+="[${prev}]drawbox=x=33:y=${PROGRESS_Y}:w=280:h=2:color=white@0.15:t=fill[pg1];"
+    CHAIN+="[${prev}]drawtext=fontfile=${FONT}:text='STORY PROGRESS':fontcolor=white@0.35:fontsize=9:x=33:y=$((PROGRESS_Y - 15))[pgcap];"
+    CHAIN+="[pgcap]drawbox=x=33:y=${PROGRESS_Y}:w=280:h=2:color=white@0.15:t=fill[pg1];"
     CHAIN+="[pg1]drawbox=x=33:y=${PROGRESS_Y}:w='280*(mod(t\,${SLOT}))/${SLOT}':h=2:color=${GOLD}:t=fill[pg2];"
     prev="pg2"
 
@@ -667,7 +722,16 @@ build_final_filter() {
 
     tail+="[tk6]drawtext=fontfile=${FONT}:text='${CHANNEL_NAME}':fontcolor=white@0.45:fontsize=15:borderw=1.5:bordercolor=black@0.7:x=353:y=655[wm1];"
 
-    tail+="[wm1]drawbox=x=0:y=0:w=1280:h=720:color=black@0.5:t=2[final]"
+    # Pulsing ring around the subscribe icon (baked into overlay.png at
+    # SUB_ICON_X/SUB_ICON_Y) — visible for 1s out of every 3s, so it
+    # catches the eye without being a constant distraction.
+    local SUB_PULSE_ENABLE="lt(mod(t\,3)\,1)"
+    local sub_ring_x=$((SUB_ICON_X - SUB_ICON_R))
+    local sub_ring_y=$((SUB_ICON_Y - SUB_ICON_R))
+    local sub_ring_d=$((SUB_ICON_R * 2))
+    tail+="[wm1]drawbox=x=${sub_ring_x}:y=${sub_ring_y}:w=${sub_ring_d}:h=${sub_ring_d}:color=${GOLD}@0.9:t=3:enable='${SUB_PULSE_ENABLE}'[wm2];"
+
+    tail+="[wm2]drawbox=x=0:y=0:w=1280:h=720:color=black@0.5:t=2[final]"
 
     echo "$tail"
 }
