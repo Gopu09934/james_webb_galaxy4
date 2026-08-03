@@ -378,13 +378,18 @@ build_labels_chain() {
     fi
     echo "Using coordinate labels: $labels_file ($n label(s))"
 
-    local BOX_W=260
     local BOX_H=42
     local V_OFFSET=70
     local H_OFFSET=40
     local ACCENT_W=4
     local BOX_GAP=10          # minimum clear space required between two label boxes
-    local placed_x=() placed_y=()  # top-left corners of boxes already placed this video
+    local LABEL_FONTSIZE=18
+    local LABEL_PAD_L=14      # gap between accent bar and text start
+    local LABEL_PAD_R=16      # gap between text end and box's right edge
+    local AVG_CHAR_W=10       # rough proportional-font width estimate at fontsize 18
+    local BOX_W_MIN=110       # never smaller than this, even for a 1-word label
+    local BOX_W_MAX=260       # never bigger than this, even for a long label
+    local placed_x=() placed_y=() placed_w=()  # boxes already placed this video
     local k collision tries
 
     # Split the pre-rendered marker image (input [2:v]) into one copy per
@@ -399,13 +404,20 @@ build_labels_chain() {
         local x="${xs[$i]}" y="${ys[$i]}" text="${texts[$i]}"
         printf '%s' "$text" > "$ASSET_DIR/label${idx}.txt"
 
+        # Auto-size the box to the label's text instead of using one
+        # fixed width for every label — "Pulsar Wind" no longer gets the
+        # same wide box as a much longer phrase.
+        local box_w=$(( ${#text} * AVG_CHAR_W + ACCENT_W + LABEL_PAD_L + LABEL_PAD_R ))
+        [ "$box_w" -lt "$BOX_W_MIN" ] && box_w=$BOX_W_MIN
+        [ "$box_w" -gt "$BOX_W_MAX" ] && box_w=$BOX_W_MAX
+
         local box_y=$((y - V_OFFSET))
         if [ "$box_y" -lt 20 ]; then
             box_y=$((y + V_OFFSET - BOX_H))
         fi
         local box_x=$((x + H_OFFSET))
-        if [ $((box_x + BOX_W)) -gt 1260 ]; then
-            box_x=$((x - H_OFFSET - BOX_W))
+        if [ $((box_x + box_w)) -gt 1260 ]; then
+            box_x=$((x - H_OFFSET - box_w))
         fi
         [ "$box_x" -lt 0 ] && box_x=10
 
@@ -418,9 +430,9 @@ build_labels_chain() {
         while :; do
             collision=false
             for ((k = 0; k < ${#placed_x[@]}; k++)); do
-                local px="${placed_x[$k]}" py="${placed_y[$k]}"
-                if [ $((box_x)) -lt $((px + BOX_W + BOX_GAP)) ] && \
-                   [ $((box_x + BOX_W + BOX_GAP)) -gt $((px)) ] && \
+                local px="${placed_x[$k]}" py="${placed_y[$k]}" pw="${placed_w[$k]}"
+                if [ $((box_x)) -lt $((px + pw + BOX_GAP)) ] && \
+                   [ $((box_x + box_w + BOX_GAP)) -gt $((px)) ] && \
                    [ $((box_y)) -lt $((py + BOX_H + BOX_GAP)) ] && \
                    [ $((box_y + BOX_H + BOX_GAP)) -gt $((py)) ]; then
                     collision=true
@@ -440,6 +452,7 @@ build_labels_chain() {
         done
         placed_x+=("$box_x")
         placed_y+=("$box_y")
+        placed_w+=("$box_w")
 
         local seg_y_top seg_y_bot
         if [ "$box_y" -gt "$y" ]; then
@@ -464,10 +477,10 @@ build_labels_chain() {
         LABELS_CHAIN+="[${prev}]drawbox=x=${x}:y=${seg_y_top}:w=2:h=${seg_h}:color=${GOLD}@0.85:t=fill[${n2}];"
         LABELS_CHAIN+="[${n2}]drawbox=x=${h_left}:y=${box_y}:w=${h_w}:h=2:color=${GOLD}@0.85:t=fill[${n3}];"
         # Label box: dark fill + gold accent bar (left edge) + thin gold outline
-        LABELS_CHAIN+="[${n3}]drawbox=x=${box_x}:y=${box_y}:w=${BOX_W}:h=${BOX_H}:color=black@0.78:t=fill[${n4}];"
+        LABELS_CHAIN+="[${n3}]drawbox=x=${box_x}:y=${box_y}:w=${box_w}:h=${BOX_H}:color=black@0.78:t=fill[${n4}];"
         LABELS_CHAIN+="[${n4}]drawbox=x=${box_x}:y=${box_y}:w=${ACCENT_W}:h=${BOX_H}:color=${GOLD}:t=fill[${n5}];"
-        LABELS_CHAIN+="[${n5}]drawbox=x=${box_x}:y=${box_y}:w=${BOX_W}:h=${BOX_H}:color=${GOLD}@0.5:t=1[${n6}];"
-        LABELS_CHAIN+="[${n6}]drawtext=fontfile=${FONT}:textfile=${ASSET_DIR}/label${idx}.txt:fontcolor=white:fontsize=18:x=$((box_x + ACCENT_W + 14)):y=$((box_y + (BOX_H - 18) / 2)):${SHADOW}[${n7}];"
+        LABELS_CHAIN+="[${n5}]drawbox=x=${box_x}:y=${box_y}:w=${box_w}:h=${BOX_H}:color=${GOLD}@0.5:t=1[${n6}];"
+        LABELS_CHAIN+="[${n6}]drawtext=fontfile=${FONT}:textfile=${ASSET_DIR}/label${idx}.txt:fontcolor=white:fontsize=${LABEL_FONTSIZE}:x=$((box_x + ACCENT_W + LABEL_PAD_L)):y=$((box_y + (BOX_H - LABEL_FONTSIZE) / 2)):${SHADOW}[${n7}];"
         # Circular gold-ring/white marker dot, overlaid on top of everything
         LABELS_CHAIN+="[${n7}][dm${idx}]overlay=x=$((x - 8)):y=$((y - 8))[${n1}];"
 
@@ -572,7 +585,7 @@ prepare_video_content() {
     echo "Longest headline wraps to $MAX_HEADLINE_LINES line(s)."
 
     HEADLINE_Y=230
-    PROGRESS_Y=$((HEADLINE_Y + MAX_HEADLINE_LINES * HEADLINE_LINE_H + 26))
+    PROGRESS_Y=$((HEADLINE_Y + MAX_HEADLINE_LINES * HEADLINE_LINE_H + 40))
     DOTS_Y=$((PROGRESS_Y + 20))
     FACT_DIVIDER_Y=$((DOTS_Y + 40))
     FACT_LABEL_Y=$((FACT_DIVIDER_Y + 14))
