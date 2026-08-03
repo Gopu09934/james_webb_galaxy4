@@ -320,6 +320,17 @@ build_labels_chain() {
     base="${url##*/}"
     base="${base%.*}"
 
+    # FIX: without `local`, every bare loop variable assigned in this
+    # function (i, idx, and the C-style `for ((i=...))` counters below)
+    # is a GLOBAL bash variable. The main stream loop at the bottom of
+    # this file also uses a bare `i` (`for ((i = 0; i < NUM_URLS; i++))`),
+    # and this function runs (via prepare_video_content -> run_video)
+    # once per video inside that loop. Any unscoped `i`/`idx` in here
+    # silently overwrites the outer loop's counter, which is what caused
+    # the stream to get stuck replaying the first video forever instead
+    # of advancing through the whole playlist.
+    local i idx
+
     LABELS_CHAIN=""
     LABELS_OUT="[base]"
 
@@ -362,7 +373,7 @@ build_labels_chain() {
 
     local prev="base"
     for ((i = 0; i < n; i++)); do
-        local idx=$((i + 1))
+        idx=$((i + 1))
         local x="${xs[$i]}" y="${ys[$i]}" text="${texts[$i]}"
         printf '%s' "$text" > "$ASSET_DIR/label${idx}.txt"
 
@@ -439,6 +450,15 @@ prepare_video_content() {
     local base
     base="${url##*/}"
     base="${base%.*}"
+
+    # FIX: same reasoning as build_labels_chain() above — this function
+    # is also called once per video from inside the outer stream loop
+    # (`for ((i = 0; i < NUM_URLS; i++))` at the bottom of this file),
+    # and it reuses bare `i`/`idx` in several for-loops below. Without
+    # `local`, those loops overwrite the outer loop's global `i`, which
+    # made the stream get stuck re-playing the first video forever
+    # instead of advancing through the playlist.
+    local i idx
 
     RAW_LINES=()
     if [ -f "${base}.headlines.txt" ]; then
