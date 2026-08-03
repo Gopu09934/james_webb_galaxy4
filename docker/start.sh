@@ -785,6 +785,9 @@ run_video() {
         ffmpeg \
         -hide_banner \
         -loglevel info \
+        -reconnect 1 \
+        -reconnect_streamed 1 \
+        -reconnect_delay_max 5 \
         -re \
         -i "$url" \
         -loop 1 -i overlay.png \
@@ -873,8 +876,7 @@ while true; do
             run_bumper "$next_url"
         fi
 
-        echo "Loading next video in 5 seconds..."
+        echo "Loading next video..."
         echo ""
-        sleep 5
     done
 done
