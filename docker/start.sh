@@ -111,10 +111,10 @@ fi
 # Background clock writer (avoids fragile
 # drawtext %{gmtime} expansion syntax)
 #############################################
-date -u +'%H:%M:%S  UTC' > "$ASSET_DIR/clock.txt"
+date -u +'%d %b %Y  •  %H:%M:%S UTC' > "$ASSET_DIR/clock.txt"
 (
     while true; do
-        date -u +'%H:%M:%S  UTC' > "$ASSET_DIR/clock.txt.tmp"
+        date -u +'%d %b %Y  •  %H:%M:%S UTC' > "$ASSET_DIR/clock.txt.tmp"
         mv -f "$ASSET_DIR/clock.txt.tmp" "$ASSET_DIR/clock.txt"
         sleep 1
     done
