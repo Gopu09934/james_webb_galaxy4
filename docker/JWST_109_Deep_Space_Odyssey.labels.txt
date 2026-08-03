@@ -1,0 +1,3 @@
+613,86,Dust cloud region
+949,520,Glowing gas knot
+1191,154,Dust cloud region (right)

@@ -1,0 +1,3 @@
+920,352,Dust cloud region (lower)
+580,528,Ionised gas cloud
+1037,90,Dust cloud region (upper)

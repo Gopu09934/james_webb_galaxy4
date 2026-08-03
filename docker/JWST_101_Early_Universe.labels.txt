@@ -1,0 +1,3 @@
+877,187,Dust filament
+423,90,Bright foreground star
+1204,472,Dust cloud region

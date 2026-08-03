@@ -1,0 +1,3 @@
+912,501,Dust cloud region (lower)
+838,305,Dust cloud region (middle)
+652,337,Dust cloud region (left)

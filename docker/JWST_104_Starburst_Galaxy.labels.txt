@@ -1,0 +1,3 @@
+739,128,Ionised gas cloud
+1024,314,Dust cloud region
+414,233,Glowing gas knot

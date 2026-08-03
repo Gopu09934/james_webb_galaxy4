@@ -1,0 +1,3 @@
+828,115,Background galaxy
+550,298,Ionised gas cloud (lower)
+572,69,Ionised gas cloud (upper)
