@@ -1,0 +1,3 @@
+1135,88,Dust cloud region
+855,117,Bright foreground star (upper)
+656,347,Bright foreground star (lower)
