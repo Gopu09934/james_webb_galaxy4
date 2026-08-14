@@ -1,7 +1,7 @@
 name: Restart Stream on Completion
 on:
   workflow_run:
-    workflows: ["Stream"]
+    #workflows: ["Stream"]
     types: [completed]
 
 permissions:
