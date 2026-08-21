@@ -1,3 +1,4 @@
-897,150,Pulsar Wind
-1206,86,Cosmic Dust
-658,345,Expanding Gas
+450,145,Distant Galaxy
+720,260,Hydrogen Cloud
+1030,180,Star Cluster
+1160,470,Hot Plasma
