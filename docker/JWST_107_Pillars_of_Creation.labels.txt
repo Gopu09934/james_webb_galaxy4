@@ -1,3 +1,4 @@
-912,501,Neutron Star
-838,305,Dust Clouds
-652,337,Deep Space
+450,150,Distant Galaxy
+700,300,Hydrogen Cloud
+940,180,Star Cluster
+1080,460,Hot Plasma
