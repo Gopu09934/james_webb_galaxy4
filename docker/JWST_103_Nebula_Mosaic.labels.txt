@@ -1,4 +1,4 @@
-450,145,Distant Galaxy
-720,260,Hydrogen Cloud
-1030,180,Star Cluster
-1160,470,Hot Plasma
+460,180,Distant Stars
+700,350,Emission Cloud
+880,120,Galaxy Cluster
+1050,530,Stellar Wind
