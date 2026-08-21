@@ -1,4 +1,4 @@
-610,110,Ancient Galaxy
-890,245,Cosmic Dust
-1160,410,Hot Plasma
-760,520,Young Stars
+460,300,Star Birth Region
+720,150,Galaxy Core
+900,260,Cosmic Filament
+1050,570,Distant Stars
