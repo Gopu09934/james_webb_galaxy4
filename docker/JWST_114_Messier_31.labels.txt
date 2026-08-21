@@ -1,3 +1,4 @@
-877,187,Pulsar
-423,90,Deep Space
-1204,472,Ionized Gas
+450,160,Stellar Nursery
+1015,225,Distant Galaxy
+560,420,Dust Cloud
+1140,350,Star Formation
