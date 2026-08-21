@@ -1,3 +1,4 @@
-877,187,Pulsar
-423,90,Deep Space
-1204,472,Ionized Gas
+680,180,Emission Nebula
+930,300,Galaxy Core
+480,500,Stellar Wind
+1120,520,Brilliant Stars
