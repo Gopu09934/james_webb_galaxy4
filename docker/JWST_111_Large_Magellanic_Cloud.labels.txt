@@ -1,4 +1,4 @@
-877,187,Pulsar
-423,90,Deep Space
-1204,472,Ionized Gas
-735,315,Star Cluster
+440,130,Cosmic Cloud
+700,200,Supernova Debris
+920,380,Young Cluster
+1050,550,Ionized Region
