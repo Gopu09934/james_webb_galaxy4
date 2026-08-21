@@ -1,3 +1,4 @@
-877,187,Pulsar
-423,90,Deep Space
-1204,472,Ionized Gas
+540,100,Galaxy Halo
+790,280,Hydrogen Cloud
+1080,390,Supernova Remnant
+620,560,Cosmic Filament
