@@ -1,3 +1,4 @@
-1135,88,Cosmic Web
-855,117,Stellar Explosion
-656,347,Radiation Zone
+620,105,Galaxy Core
+880,190,Stellar Nursery
+1080,350,Cosmic Dust
+760,540,Young Stars
