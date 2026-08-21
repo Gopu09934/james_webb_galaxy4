@@ -1,4 +1,4 @@
-440,130,Cosmic Cloud
-700,200,Supernova Debris
-920,380,Young Cluster
-1050,550,Ionized Region
+680,130,Cosmic Cloud
+820,220,Supernova Debris
+980,380,Young Cluster
+760,540,Ionized Region
