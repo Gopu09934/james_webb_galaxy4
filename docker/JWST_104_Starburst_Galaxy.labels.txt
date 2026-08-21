@@ -1,4 +1,4 @@
-540,115,Emission Nebula
-920,240,Galaxy Arm
-680,390,Stellar Wind
-1110,550,Dust Lane
+500,140,Deep Space
+780,220,Star Nursery
+940,410,Supernova Remnant
+1100,300,Cosmic Filament
