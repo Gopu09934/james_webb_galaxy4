@@ -1,3 +1,4 @@
-739,128,Ionized Gas
-1024,314,Supernova Debris
-414,233,Energy Jets
+540,115,Emission Nebula
+920,240,Galaxy Arm
+680,390,Stellar Wind
+1110,550,Dust Lane
