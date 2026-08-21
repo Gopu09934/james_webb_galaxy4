@@ -1,3 +1,4 @@
-920,352,Dust Clouds
-580,428,Background Star
-1037,90,Hot Plasma
+430,220,Ancient Starlight
+800,125,Blue Giant
+1050,310,Gas Filament
+1180,520,Nebula Core
