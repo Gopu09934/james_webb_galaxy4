@@ -1,3 +1,4 @@
-613,86,Ionized Gas
-949,520,Bright Star
-1191,154,Expanding Gas
+470,230,Ancient Starlight
+730,130,Blue Giant
+930,320,Gas Filament
+1080,520,Nebula Core
