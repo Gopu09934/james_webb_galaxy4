@@ -1,3 +1,4 @@
-1160,275,Energy Jets
-946,225,Background Star
-684,347,Dust Clouds
+560,160,Dark Nebula
+780,330,Galaxy Halo
+1000,460,Star Formation
+680,570,Brilliant Stars
