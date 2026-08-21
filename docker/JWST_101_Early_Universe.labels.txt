@@ -1,4 +1,4 @@
-540,100,Galaxy Halo
-790,280,Hydrogen Cloud
-1080,390,Supernova Remnant
-620,560,Cosmic Filament
+480,110,Galaxy Halo
+680,250,Star Formation
+900,170,Cosmic Dust
+1040,430,Young Stars
