@@ -1,3 +1,4 @@
-828,115,Hot Plasma
-650,298,Synchrotron Glow
-572,69,Ionized Gas
+540,110,Emission Nebula
+820,250,Galaxy Arm
+650,400,Stellar Wind
+1010,540,Dust Lane
