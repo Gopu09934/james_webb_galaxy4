@@ -13,6 +13,60 @@ if [ -z "${YOUTUBE_STREAM_KEY:-}" ]; then
     exit 1
 fi
 
+#############################################
+# Background audio (replaces the source video's
+# own audio entirely — the video is always
+# muted). BACKGROUND_AUDIO_URL is a comma-
+# separated list of one or more audio URLs
+# (same convention as VIDEO_URL), played back to
+# back and looped forever via ffmpeg's concat
+# demuxer + -stream_loop -1. Optional: if unset,
+# the stream is simply silent instead of using
+# the source video's audio.
+#
+# Note on continuity: each video runs as its own
+# ffmpeg process (see run_video()), so the audio
+# playlist restarts from the top of the list
+# every time a new video begins — it loops
+# continuously *within* a video, but isn't
+# phase-continuous across video cuts. Given the
+# visuals already cut at that point too, this is
+# a reasonable trade for the added complexity a
+# fully seamless cross-process audio pipeline
+# would need.
+#############################################
+AUDIO_PLAYLIST_FILE="audio_playlist.txt"
+AUDIO_INPUT_ARGS=()
+if [ -n "${BACKGROUND_AUDIO_URL:-}" ]; then
+    IFS=',' read -ra RAW_AUDIO_URLS <<< "$BACKGROUND_AUDIO_URL"
+    AUDIO_URLS=()
+    for u in "${RAW_AUDIO_URLS[@]}"; do
+        u="${u#"${u%%[![:space:]]*}"}"
+        u="${u%"${u##*[![:space:]]}"}"
+        [ -n "$u" ] && AUDIO_URLS+=("$u")
+    done
+    if [ "${#AUDIO_URLS[@]}" -eq 0 ]; then
+        echo "NOTICE: BACKGROUND_AUDIO_URL was set but contained no valid entries — stream will be silent."
+    else
+        : > "$AUDIO_PLAYLIST_FILE"
+        for u in "${AUDIO_URLS[@]}"; do
+            # Escape single quotes for the concat demuxer's quoted
+            # 'file' entries (harmless no-op for URLs without any).
+            esc="${u//\'/\'\\\'\'}"
+            printf "file '%s'\n" "$esc" >> "$AUDIO_PLAYLIST_FILE"
+        done
+        echo "Background audio playlist (${#AUDIO_URLS[@]} track(s), looping):"
+        for u in "${AUDIO_URLS[@]}"; do
+            echo "  - $u"
+        done
+        AUDIO_INPUT_ARGS=(-protocol_whitelist file,http,https,tcp,tls,crypto -stream_loop -1 -f concat -safe 0 -i "$AUDIO_PLAYLIST_FILE")
+    fi
+fi
+if [ "${#AUDIO_INPUT_ARGS[@]}" -eq 0 ]; then
+    echo "NOTICE: BACKGROUND_AUDIO_URL not set — stream will be silent (source video audio is always muted)."
+    AUDIO_INPUT_ARGS=(-f lavfi -i "anullsrc=r=48000:cl=stereo")
+fi
+
 # Subscriber count + live viewer count are optional — if the API creds
 # aren't provided, those panel elements just stay blank instead of
 # failing the whole stream.
@@ -63,6 +117,44 @@ VIEWER_MIN_TO_SHOW=10
 SUB_ICON_X=1249
 SUB_ICON_Y=677
 SUB_ICON_R=20
+
+# Real wall-clock start of the whole broadcast (not any single video).
+# Each video runs as its own ffmpeg process, so `t` resets to 0 every
+# time — anything that needs to stay in sync across video boundaries
+# (like the poll/info panel switch below) has to add this offset back
+# in rather than relying on `t` alone. See VIDEO_START_OFFSET in
+# run_video().
+STREAM_START_EPOCH=$(date +%s)
+
+#############################################
+# Live audience poll (alternates with the info
+# panel below): minutes 0-5 of every 10-minute
+# cycle show a poll question with live vote-bar
+# percentages; minutes 5-10 show the regular
+# headline/fact info panel. Votes are tallied
+# from the YouTube live chat (`!vote 1` /
+# `!vote 2`) by the background poller further
+# down. Falls back gracefully with 0% bars if
+# API creds aren't configured — the question
+# still rotates either way.
+#############################################
+POLL_CYCLE=300     # a new poll question every 5 min
+POLL_WINDOW=45     # poll panel is only visible for the final 45s of
+                    # each cycle (a "reveal" moment) — the info panel
+                    # runs the rest of the time, and votes cast via
+                    # chat during that stretch are what the reveal
+                    # shows. Voting itself isn't gated by visibility:
+                    # `!vote 1`/`!vote 2` count for the whole 5-minute
+                    # window even while the info panel is on screen.
+BAR_CHARS=24       # width of the text-based vote bar, in characters
+POLLS_FILE="polls.txt"
+
+DEFAULT_POLLS=(
+    "Which target next?|Carina Nebula|Pillars of Creation"
+    "Favorite JWST image so far?|Southern Ring Nebula|Stephan's Quintet"
+    "What should we explore next?|Exoplanet atmospheres|Black hole jets"
+    "Which mission excites you more?|Euclid|Vera Rubin Observatory"
+)
 
 #############################################
 # Up-next bumper (shown between videos)
@@ -184,6 +276,10 @@ if [ "$SHOW_STATS" = true ]; then
             if [ -z "$LIVE_VIDEO_ID" ]; then
                 SEARCH_RESP=$(curl -s "https://www.googleapis.com/youtube/v3/search?part=id&channelId=${YOUTUBE_CHANNEL_ID}&eventType=live&type=video&key=${YOUTUBE_API_KEY}" || true)
                 LIVE_VIDEO_ID=$(echo "$SEARCH_RESP" | grep -o '"videoId": *"[^"]*"' | head -1 | sed -E 's/.*"videoId": *"([^"]*)".*/\1/')
+                if [ -n "$LIVE_VIDEO_ID" ]; then
+                    printf '%s' "$LIVE_VIDEO_ID" > "$ASSET_DIR/live_video_id.txt.tmp"
+                    mv -f "$ASSET_DIR/live_video_id.txt.tmp" "$ASSET_DIR/live_video_id.txt"
+                fi
             fi
             if [ -n "$LIVE_VIDEO_ID" ]; then
                 VRESP=$(curl -s "https://www.googleapis.com/youtube/v3/videos?part=liveStreamingDetails&id=${LIVE_VIDEO_ID}&key=${YOUTUBE_API_KEY}" || true)
@@ -200,6 +296,7 @@ if [ "$SHOW_STATS" = true ]; then
                     # Broadcast ended or hasn't registered yet — clear and re-search.
                     LIVE_VIDEO_ID=""
                     printf ' ' > "$ASSET_DIR/viewers.txt"
+                    rm -f "$ASSET_DIR/live_video_id.txt"
                 fi
             fi
             sleep 30
@@ -208,7 +305,144 @@ if [ "$SHOW_STATS" = true ]; then
     VIEWERS_PID=$!
 fi
 
-trap 'kill "$CLOCK_PID" 2>/dev/null || true; [ -n "$SUBS_PID" ] && kill "$SUBS_PID" 2>/dev/null || true; [ -n "$VIEWERS_PID" ] && kill "$VIEWERS_PID" 2>/dev/null || true' EXIT
+trap 'kill "$CLOCK_PID" 2>/dev/null || true; [ -n "$SUBS_PID" ] && kill "$SUBS_PID" 2>/dev/null || true; [ -n "$VIEWERS_PID" ] && kill "$VIEWERS_PID" 2>/dev/null || true; [ -n "$POLL_PID" ] && kill "$POLL_PID" 2>/dev/null || true' EXIT
+
+#############################################
+# Background poll writer: rotates the question
+# every POLL_CYCLE seconds on wall-clock time
+# (independent of which video is currently
+# playing) and, when API creds are available,
+# tallies `!vote 1` / `!vote 2` chat messages
+# into live percentage bars.
+#
+# The question/option rotation always runs (no
+# API needed for that part); only the chat
+# lookup itself is gated behind SHOW_STATS, so
+# without credentials the poll panel still shows
+# a rotating question with bars parked at 0%
+# instead of disappearing entirely.
+#
+# Vote bars are rendered as plain text (a string
+# of '#' and '.' characters via drawtext, same
+# reload=1 technique as clock.txt/subs.txt)
+# rather than a dynamically-sized drawbox,
+# because ffmpeg's filter graph has no way to
+# feed a live external number into another
+# filter's numeric parameters each frame short
+# of an expensive per-pixel filter — and we
+# already paid for that mistake once with the
+# panel-entrance blend filter. Text is cheap and
+# reload=1 already proven reliable here.
+#############################################
+mkdir -p "$ASSET_DIR"
+printf ' ' > "$ASSET_DIR/poll_question.txt"
+printf ' ' > "$ASSET_DIR/poll_opt1.txt"
+printf ' ' > "$ASSET_DIR/poll_opt2.txt"
+printf '%0.s.' $(seq 1 "$BAR_CHARS") > "$ASSET_DIR/poll_bar1.txt"
+printf '%0.s.' $(seq 1 "$BAR_CHARS") > "$ASSET_DIR/poll_bar2.txt"
+printf 'Vote in chat: !vote 1 or !vote 2' > "$ASSET_DIR/poll_votes.txt"
+
+POLL_PID=""
+(
+    POLLS=()
+    if [ -f "$POLLS_FILE" ]; then
+        while IFS= read -r line; do
+            [ -n "$(echo "$line" | tr -d '[:space:]')" ] && POLLS+=("$line")
+        done < "$POLLS_FILE"
+    fi
+    [ "${#POLLS[@]}" -eq 0 ] && POLLS=("${DEFAULT_POLLS[@]}")
+    NUM_POLLS=${#POLLS[@]}
+
+    # Prints a BAR_CHARS-wide bar of '#' (filled) / '.' (empty) for a
+    # given 0-100 percentage.
+    render_bar() {
+        local pct="$1" filled empty
+        filled=$(( (pct * BAR_CHARS + 50) / 100 ))
+        [ "$filled" -lt 0 ] && filled=0
+        [ "$filled" -gt "$BAR_CHARS" ] && filled=$BAR_CHARS
+        empty=$((BAR_CHARS - filled))
+        [ "$filled" -gt 0 ] && printf '%0.s#' $(seq 1 "$filled")
+        [ "$empty" -gt 0 ] && printf '%0.s.' $(seq 1 "$empty")
+    }
+
+    LAST_WINDOW_IDX=-1
+    VOTES1=0
+    VOTES2=0
+    LIVE_CHAT_ID=""
+    NEXT_PAGE_TOKEN=""
+    CHAT_POLL_INTERVAL=10
+
+    while true; do
+        NOW=$(date +%s)
+        ELAPSED=$((NOW - STREAM_START_EPOCH))
+        WINDOW_IDX=$(( (ELAPSED / POLL_CYCLE) % NUM_POLLS ))
+
+        if [ "$WINDOW_IDX" -ne "$LAST_WINDOW_IDX" ]; then
+            # New 10-minute cycle — new question, reset the tally.
+            LAST_WINDOW_IDX=$WINDOW_IDX
+            VOTES1=0
+            VOTES2=0
+            NEXT_PAGE_TOKEN=""
+            IFS='|' read -r Q O1 O2 <<< "${POLLS[$WINDOW_IDX]}"
+            echo "$Q" | fold -s -w 25 > "$ASSET_DIR/poll_question.txt.tmp" && mv -f "$ASSET_DIR/poll_question.txt.tmp" "$ASSET_DIR/poll_question.txt"
+            printf '[1] %s' "$O1" > "$ASSET_DIR/poll_opt1.txt.tmp" && mv -f "$ASSET_DIR/poll_opt1.txt.tmp" "$ASSET_DIR/poll_opt1.txt"
+            printf '[2] %s' "$O2" > "$ASSET_DIR/poll_opt2.txt.tmp" && mv -f "$ASSET_DIR/poll_opt2.txt.tmp" "$ASSET_DIR/poll_opt2.txt"
+            render_bar 0 > "$ASSET_DIR/poll_bar1.txt.tmp" && mv -f "$ASSET_DIR/poll_bar1.txt.tmp" "$ASSET_DIR/poll_bar1.txt"
+            render_bar 0 > "$ASSET_DIR/poll_bar2.txt.tmp" && mv -f "$ASSET_DIR/poll_bar2.txt.tmp" "$ASSET_DIR/poll_bar2.txt"
+            printf 'Vote in chat: !vote 1 or !vote 2' > "$ASSET_DIR/poll_votes.txt.tmp" && mv -f "$ASSET_DIR/poll_votes.txt.tmp" "$ASSET_DIR/poll_votes.txt"
+            echo "NOTICE: New poll: ${Q} (1: ${O1} / 2: ${O2})"
+        fi
+
+        if [ "$SHOW_STATS" = true ]; then
+            if [ -z "$LIVE_CHAT_ID" ]; then
+                VIDEO_ID=""
+                [ -f "$ASSET_DIR/live_video_id.txt" ] && VIDEO_ID="$(cat "$ASSET_DIR/live_video_id.txt" 2>/dev/null)"
+                if [ -n "$VIDEO_ID" ]; then
+                    VRESP=$(curl -s "https://www.googleapis.com/youtube/v3/videos?part=liveStreamingDetails&id=${VIDEO_ID}&key=${YOUTUBE_API_KEY}" || true)
+                    LIVE_CHAT_ID=$(echo "$VRESP" | grep -o '"activeLiveChatId": *"[^"]*"' | head -1 | sed -E 's/.*"activeLiveChatId": *"([^"]*)".*/\1/')
+                fi
+            fi
+
+            if [ -n "$LIVE_CHAT_ID" ]; then
+                CHAT_URL="https://www.googleapis.com/youtube/v3/liveChat/messages?liveChatId=${LIVE_CHAT_ID}&part=snippet&key=${YOUTUBE_API_KEY}"
+                [ -n "$NEXT_PAGE_TOKEN" ] && CHAT_URL="${CHAT_URL}&pageToken=${NEXT_PAGE_TOKEN}"
+                CRESP=$(curl -s "$CHAT_URL" || true)
+
+                if [ -z "$CRESP" ] || ! echo "$CRESP" | grep -q '"pollingIntervalMillis"'; then
+                    # Chat lookup failed (broadcast/chat ended, bad id,
+                    # etc.) — clear and let the next loop re-resolve it.
+                    LIVE_CHAT_ID=""
+                    NEXT_PAGE_TOKEN=""
+                else
+                    NEXT_PAGE_TOKEN=$(echo "$CRESP" | grep -o '"nextPageToken": *"[^"]*"' | head -1 | sed -E 's/.*"nextPageToken": *"([^"]*)".*/\1/')
+                    NEW_INTERVAL=$(echo "$CRESP" | grep -o '"pollingIntervalMillis": *[0-9]*' | head -1 | grep -oE '[0-9]+')
+                    if [ -n "$NEW_INTERVAL" ] && [ "$NEW_INTERVAL" -ge 5000 ]; then
+                        CHAT_POLL_INTERVAL=$(( NEW_INTERVAL / 1000 ))
+                    fi
+                    while IFS= read -r MSG; do
+                        NORM=$(echo "$MSG" | tr '[:upper:]' '[:lower:]' | tr -d '[:space:]')
+                        case "$NORM" in
+                            '!vote1') VOTES1=$((VOTES1 + 1)) ;;
+                            '!vote2') VOTES2=$((VOTES2 + 1)) ;;
+                        esac
+                    done < <(echo "$CRESP" | grep -o '"displayMessage": *"[^"]*"' | sed -E 's/.*"displayMessage": *"([^"]*)".*/\1/')
+
+                    TOTAL=$((VOTES1 + VOTES2))
+                    if [ "$TOTAL" -gt 0 ]; then
+                        PCT1=$(( VOTES1 * 100 / TOTAL ))
+                        PCT2=$((100 - PCT1))
+                        render_bar "$PCT1" > "$ASSET_DIR/poll_bar1.txt.tmp" && mv -f "$ASSET_DIR/poll_bar1.txt.tmp" "$ASSET_DIR/poll_bar1.txt"
+                        render_bar "$PCT2" > "$ASSET_DIR/poll_bar2.txt.tmp" && mv -f "$ASSET_DIR/poll_bar2.txt.tmp" "$ASSET_DIR/poll_bar2.txt"
+                        printf '%s votes  •  %s%% / %s%%' "$TOTAL" "$PCT1" "$PCT2" > "$ASSET_DIR/poll_votes.txt.tmp" && mv -f "$ASSET_DIR/poll_votes.txt.tmp" "$ASSET_DIR/poll_votes.txt"
+                    fi
+                fi
+            fi
+        fi
+
+        sleep "$CHAT_POLL_INTERVAL"
+    done
+) &
+POLL_PID=$!
 
 #############################################
 # Static panel text (unchanged across videos)
@@ -491,7 +725,7 @@ build_labels_chain() {
         LABELS_CHAIN+="[${n5}]drawbox=x=${box_x}:y=${box_y}:w=${box_w}:h=${BOX_H}:color=${GOLD}@0.5:t=1[${n6}];"
         LABELS_CHAIN+="[${n6}]drawtext=fontfile=${FONT}:textfile=${ASSET_DIR}/label${idx}.txt:fontcolor=white:fontsize=${LABEL_FONTSIZE}:x=$((box_x + ACCENT_W + LABEL_PAD_L)):y=$((box_y + (BOX_H - LABEL_FONTSIZE) / 2)):${SHADOW}[${n7}];"
         # Circular gold-ring/white marker dot, overlaid on top of everything
-        LABELS_CHAIN+="[${n7}][dm${idx}]overlay=x=$((x - 8)):y=$((y - 8))[${n1}];"
+        LABELS_CHAIN+="[${n7}][dm${idx}]overlay=x=$((x - 8)):y=$((y - 8)):shortest=1[${n1}];"
 
         prev="$n1"
     done
@@ -534,6 +768,17 @@ prepare_video_content() {
     # safe to call standalone (e.g. future tooling/tests).
     : "${CURRENT_INDEX:=1}"
     : "${TOTAL_VIDEOS:=1}"
+    : "${VIDEO_START_OFFSET:=0}"
+
+    # Poll panel is visible only for the final POLL_WINDOW seconds of
+    # every POLL_CYCLE-second cycle — a brief "results reveal" — with
+    # the info panel (headlines/facts) running the rest of the time.
+    # VIDEO_START_OFFSET (set by run_video()) shifts ffmpeg's own
+    # per-process `t` back onto real wall-clock time so this stays in
+    # sync across video boundaries.
+    local poll_start=$((POLL_CYCLE - POLL_WINDOW))
+    POLL_ENABLE="gte(mod(t+${VIDEO_START_OFFSET}\,${POLL_CYCLE})\,${poll_start})"
+    INFO_ENABLE="lt(mod(t+${VIDEO_START_OFFSET}\,${POLL_CYCLE})\,${poll_start})"
 
     # Optional category chip (e.g. "EXOPLANETS", "BLACK HOLES") shown
     # next to the section header when a <basename>.category.txt file
@@ -653,7 +898,7 @@ prepare_video_content() {
     # rectangle — subtle enough not to darken the subject itself.
     CHAIN="[0:v]scale=1280:720:force_original_aspect_ratio=decrease,pad=1280:720:(ow-iw)/2:(oh-ih)/2:black,vignette=PI/6[video];"
     CHAIN+="[1:v]scale=1280:720:flags=fast_bilinear[ovl];"
-    CHAIN+="[ovl][video]overlay=0:0[base];"
+    CHAIN+="[video][ovl]overlay=0:0:shortest=1[base];"
 
     # Optional coordinate-based callout labels for this video, drawn onto
     # the raw video before the panel/UI so the panel stays on top.
@@ -702,8 +947,34 @@ prepare_video_content() {
     CHAIN+="[p11]drawtext=fontfile=${FONT}:textfile=${ASSET_DIR}/title2.txt:fontcolor=${SILVER}:fontsize=16:x=33:y=158:${SHADOW}[p12];"
     CHAIN+="[p12]drawbox=x=33:y=186:w=280:h=1:color=${GOLD}@0.35:t=fill[p13];"
 
-    CHAIN+="[p13]drawbox=x=33:y=202:w=8:h=8:color=${GOLD}:t=fill[p14];"
-    CHAIN+="[p14]drawtext=fontfile=${FONT}:textfile=${ASSET_DIR}/header.txt:fontcolor=${GOLD}:fontsize=15:x=49:y=199[p16];"
+    #########################################
+    # POLL PANEL (a brief results reveal — the
+    # final POLL_WINDOW seconds of every
+    # POLL_CYCLE-second cycle)
+    #########################################
+    CHAIN+="[p13]drawbox=x=33:y=202:w=8:h=8:color=${RED}:t=fill:enable='${POLL_ENABLE}'[pv1];"
+    CHAIN+="[pv1]drawtext=fontfile=${FONT}:text='LIVE POLL':fontcolor=${GOLD}:fontsize=15:x=49:y=199:enable='${POLL_ENABLE}'[pv2];"
+    CHAIN+="[pv2]drawtext=fontfile=${FONT}:textfile=${ASSET_DIR}/poll_question.txt:reload=1:expansion=none:fontcolor=white:fontsize=19:line_spacing=8:x=33:y=228:enable='${POLL_ENABLE}':${SHADOW}[pv3];"
+
+    CHAIN+="[pv3]drawtext=fontfile=${FONT}:textfile=${ASSET_DIR}/poll_opt1.txt:reload=1:expansion=none:fontcolor=${GOLD}:fontsize=14:x=33:y=328:enable='${POLL_ENABLE}'[pv4];"
+    CHAIN+="[pv4]drawbox=x=33:y=350:w=280:h=16:color=black@0.35:t=fill:enable='${POLL_ENABLE}'[pv5];"
+    CHAIN+="[pv5]drawbox=x=33:y=350:w=280:h=16:color=${GOLD}@0.4:t=1:enable='${POLL_ENABLE}'[pv6];"
+    CHAIN+="[pv6]drawtext=fontfile=${FONT}:textfile=${ASSET_DIR}/poll_bar1.txt:reload=1:expansion=none:fontcolor=${GOLD}:fontsize=13:x=37:y=352:enable='${POLL_ENABLE}'[pv7];"
+
+    CHAIN+="[pv7]drawtext=fontfile=${FONT}:textfile=${ASSET_DIR}/poll_opt2.txt:reload=1:expansion=none:fontcolor=${GOLD}:fontsize=14:x=33:y=384:enable='${POLL_ENABLE}'[pv8];"
+    CHAIN+="[pv8]drawbox=x=33:y=406:w=280:h=16:color=black@0.35:t=fill:enable='${POLL_ENABLE}'[pv9];"
+    CHAIN+="[pv9]drawbox=x=33:y=406:w=280:h=16:color=${GOLD}@0.4:t=1:enable='${POLL_ENABLE}'[pv10];"
+    CHAIN+="[pv10]drawtext=fontfile=${FONT}:textfile=${ASSET_DIR}/poll_bar2.txt:reload=1:expansion=none:fontcolor=${GOLD}:fontsize=13:x=37:y=408:enable='${POLL_ENABLE}'[pv11];"
+
+    CHAIN+="[pv11]drawtext=fontfile=${FONT}:textfile=${ASSET_DIR}/poll_votes.txt:reload=1:expansion=none:fontcolor=${SILVER}@0.8:fontsize=11:x=33:y=440:enable='${POLL_ENABLE}':${SHADOW}[pv12];"
+
+    #########################################
+    # INFO PANEL (headlines/facts — the default,
+    # running for all but the final POLL_WINDOW
+    # seconds of each POLL_CYCLE)
+    #########################################
+    CHAIN+="[pv12]drawbox=x=33:y=202:w=8:h=8:color=${GOLD}:t=fill:enable='${INFO_ENABLE}'[p14];"
+    CHAIN+="[p14]drawtext=fontfile=${FONT}:textfile=${ASSET_DIR}/header.txt:fontcolor=${GOLD}:fontsize=15:x=49:y=199:enable='${INFO_ENABLE}'[p16];"
 
     local prev="p16"
     if [ "$SHOW_CATEGORY" = true ]; then
@@ -725,20 +996,20 @@ prepare_video_content() {
         local end=$((start + SLOT))
         local nxt="h${idx}"
         local ALPHA="if(between(mod(t\,${CYCLE})\,${start}\,${end})\,if(lt(mod(t\,${CYCLE})-${start}\,0.6)\,(mod(t\,${CYCLE})-${start})/0.6\,if(gt(mod(t\,${CYCLE})-${start}\,${SLOT}-0.6)\,(${end}-mod(t\,${CYCLE}))/0.6\,1))\,0)"
-        CHAIN+="[${prev}]drawtext=fontfile=${FONT}:textfile=${ASSET_DIR}/headline${idx}.txt:fontcolor=white:fontsize=${HEADLINE_FONTSIZE}:line_spacing=${HEADLINE_LINE_SPACING}:x=33:y=${HEADLINE_Y}:alpha='${ALPHA}':${SHADOW}[${nxt}];"
+        CHAIN+="[${prev}]drawtext=fontfile=${FONT}:textfile=${ASSET_DIR}/headline${idx}.txt:fontcolor=white:fontsize=${HEADLINE_FONTSIZE}:line_spacing=${HEADLINE_LINE_SPACING}:x=33:y=${HEADLINE_Y}:alpha='${ALPHA}':enable='${INFO_ENABLE}':${SHADOW}[${nxt}];"
         prev="$nxt"
     done
 
-    CHAIN+="[${prev}]drawtext=fontfile=${FONT}:text='STORY ${CURRENT_INDEX} OF ${TOTAL_VIDEOS}':fontcolor=${SILVER}@0.8:fontsize=10:x=33:y=$((PROGRESS_Y - 16)):${SHADOW}[pgcap];"
-    CHAIN+="[pgcap]drawbox=x=33:y=${PROGRESS_Y}:w=280:h=2:color=${SILVER}@0.35:t=fill[pg1];"
-    CHAIN+="[pg1]drawbox=x=33:y=${PROGRESS_Y}:w='280*(mod(t\,${SLOT}))/${SLOT}':h=2:color=${GOLD}:t=fill[pg2];"
+    CHAIN+="[${prev}]drawtext=fontfile=${FONT}:text='STORY ${CURRENT_INDEX} OF ${TOTAL_VIDEOS}':fontcolor=${SILVER}@0.8:fontsize=10:x=33:y=$((PROGRESS_Y - 16)):enable='${INFO_ENABLE}':${SHADOW}[pgcap];"
+    CHAIN+="[pgcap]drawbox=x=33:y=${PROGRESS_Y}:w=280:h=2:color=${SILVER}@0.35:t=fill:enable='${INFO_ENABLE}'[pg1];"
+    CHAIN+="[pg1]drawbox=x=33:y=${PROGRESS_Y}:w='280*(mod(t\,${SLOT}))/${SLOT}':h=2:color=${GOLD}:t=fill:enable='${INFO_ENABLE}'[pg2];"
     prev="pg2"
 
     for i in "${!RAW_LINES[@]}"; do
         idx=$((i + 1))
         local x=$((33 + i * 17))
         local nxt="db${idx}"
-        CHAIN+="[${prev}]drawbox=x=${x}:y=${DOTS_Y}:w=7:h=7:color=white@0.3:t=fill[${nxt}];"
+        CHAIN+="[${prev}]drawbox=x=${x}:y=${DOTS_Y}:w=7:h=7:color=white@0.3:t=fill:enable='${INFO_ENABLE}'[${nxt}];"
         prev="$nxt"
     done
 
@@ -748,7 +1019,7 @@ prepare_video_content() {
         local x=$((33 + i * 17))
         local start=$((i * SLOT))
         local end=$((start + SLOT))
-        local ENABLE="between(mod(t\,${CYCLE})\,${start}\,${end})"
+        local ENABLE="${INFO_ENABLE}*between(mod(t\,${CYCLE})\,${start}\,${end})"
         if [ "$i" -eq "$last" ]; then
             CHAIN+="[${prev}]drawbox=x=${x}:y=${DOTS_Y}:w=7:h=7:color=${GOLD}:t=fill:enable='${ENABLE}'[pdotend];"
             prev="pdotend"
@@ -760,8 +1031,8 @@ prepare_video_content() {
     done
 
     if [ "$SHOW_FACTS" = true ]; then
-        CHAIN+="[${prev}]drawbox=x=33:y=${FACT_DIVIDER_Y}:w=280:h=2:color=${GOLD}@0.4:t=fill[fp1];"
-        CHAIN+="[fp1]drawtext=fontfile=${FONT}:textfile=${ASSET_DIR}/fact_label.txt:fontcolor=${GOLD}@0.85:fontsize=12:x=33:y=${FACT_LABEL_Y}[fp2];"
+        CHAIN+="[${prev}]drawbox=x=33:y=${FACT_DIVIDER_Y}:w=280:h=2:color=${GOLD}@0.4:t=fill:enable='${INFO_ENABLE}'[fp1];"
+        CHAIN+="[fp1]drawtext=fontfile=${FONT}:textfile=${ASSET_DIR}/fact_label.txt:fontcolor=${GOLD}@0.85:fontsize=12:x=33:y=${FACT_LABEL_Y}:enable='${INFO_ENABLE}'[fp2];"
         prev="fp2"
         for i in "${!FACTS[@]}"; do
             idx=$((i + 1))
@@ -769,7 +1040,7 @@ prepare_video_content() {
             local end=$((start + FACT_SLOT))
             local nxt="f${idx}"
             local FALPHA="if(between(mod(t\,${FACT_CYCLE})\,${start}\,${end})\,if(lt(mod(t\,${FACT_CYCLE})-${start}\,0.6)\,(mod(t\,${FACT_CYCLE})-${start})/0.6\,if(gt(mod(t\,${FACT_CYCLE})-${start}\,${FACT_SLOT}-0.6)\,(${end}-mod(t\,${FACT_CYCLE}))/0.6\,1))\,0)"
-            CHAIN+="[${prev}]drawtext=fontfile=${FONT}:textfile=${ASSET_DIR}/fact${idx}.txt:fontcolor=white@0.9:fontsize=16:line_spacing=7:x=33:y=${FACT_TEXT_Y}:alpha='${FALPHA}'[${nxt}];"
+            CHAIN+="[${prev}]drawtext=fontfile=${FONT}:textfile=${ASSET_DIR}/fact${idx}.txt:fontcolor=white@0.9:fontsize=16:line_spacing=7:x=33:y=${FACT_TEXT_Y}:alpha='${FALPHA}':enable='${INFO_ENABLE}'[${nxt}];"
             prev="$nxt"
         done
     fi
@@ -916,10 +1187,11 @@ run_bumper() {
     -hide_banner \
     -loglevel warning \
     -loop 1 -t "$BUMPER_DURATION" -i overlay.png \
-    -f lavfi -t "$BUMPER_DURATION" -i anullsrc=r=48000:cl=stereo \
+    "${AUDIO_INPUT_ARGS[@]}" \
     -filter_complex "$BFILTER" \
     -map "[final]" \
     -map 1:a \
+    -shortest \
     -r 24 \
     -s 1280x720 \
     -c:v libx264 \
@@ -951,6 +1223,14 @@ run_bumper() {
 run_video() {
     local url="$1"
     local attempt=1
+
+    # How far into the overall broadcast (not this video) we are right
+    # now, in seconds. prepare_video_content()'s poll/info enable
+    # expressions add this to ffmpeg's own `t` (which restarts at 0 for
+    # every video, since each one is a fresh ffmpeg process) so the
+    # panel switch follows real time across video boundaries instead of
+    # restarting its 10-minute cycle every time a new clip begins.
+    VIDEO_START_OFFSET=$(( $(date +%s) - STREAM_START_EPOCH ))
 
     # Load headlines/facts tied to this specific video (curated file if
     # present, otherwise a freshly shuffled pool) and rebuild the panel
@@ -989,9 +1269,10 @@ run_video() {
         -i "$url" \
         -loop 1 -i overlay.png \
         -loop 1 -i "$DOT_MARKER" \
+        "${AUDIO_INPUT_ARGS[@]}" \
         -filter_complex "$filter" \
         -map "[final]" \
-        -map 0:a? \
+        -map 3:a \
         -r 30 \
         -s 1280x720 \
         -c:v libx264 \
