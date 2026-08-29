@@ -34,27 +34,25 @@ fi
 # differ). That merged file is then looped with
 # -stream_loop -1 for every video.
 #
-# This two-step approach exists because looping a
-# *multi-file* concat playlist directly turned out
-# to be unreliable in testing — it decodes fine
-# for the first pass but throws demux errors and
-# cuts the audio short on the loop-back, regardless
-# of format (confirmed with both matching and
-# mixed-format playlists). Looping a single merged
-# file doesn't have that problem.
-#
-# Note on continuity: each video runs as its own
-# ffmpeg process (see run_video()), so playback
-# restarts from the top of the merged track every
-# time a new video begins — it loops continuously
-# *within* a video, but isn't phase-continuous
-# across video cuts. Given the visuals already cut
-# at that point too, this is a reasonable trade for
-# the added complexity a fully seamless cross-
-# process audio pipeline would need.
+# Continuity across video/bumper cuts: each video
+# (and each up-next bumper) runs as its own ffmpeg
+# process, so naively looping the merged file from
+# its start every time would reset the background
+# audio to position 0 on every cut. Instead,
+# get_audio_input_args() (defined further down)
+# computes how many seconds of real wall-clock time
+# have elapsed since the broadcast started, wraps
+# that against the merged track's probed duration,
+# and seeks the audio input to that position before
+# every ffmpeg invocation — so the track plays
+# through in full, loops forever once it reaches the
+# end, and never resets just because the video (or a
+# bumper) changed underneath it.
 #############################################
 MERGED_AUDIO_FILE="background_audio_merged.m4a"
 AUDIO_INPUT_ARGS=()
+AUDIO_MODE="silent"   # "silent" or "merged" — read by get_audio_input_args()
+AUDIO_DURATION=""     # probed duration (seconds) of MERGED_AUDIO_FILE, if available
 if [ -n "${BACKGROUND_AUDIO_URL:-}" ]; then
     IFS=',' read -ra RAW_AUDIO_URLS <<< "$BACKGROUND_AUDIO_URL"
     AUDIO_URLS=()
@@ -81,15 +79,22 @@ if [ -n "${BACKGROUND_AUDIO_URL:-}" ]; then
             -filter_complex "$CONCAT_FILTER" -map "[aout]" \
             -c:a aac -b:a 192k "$MERGED_AUDIO_FILE"; then
             echo "Background audio merged successfully -> $MERGED_AUDIO_FILE"
-            AUDIO_INPUT_ARGS=(-stream_loop -1 -i "$MERGED_AUDIO_FILE")
+            AUDIO_MODE="merged"
+            AUDIO_DURATION=$(ffprobe -v error -show_entries format=duration -of default=noprint_wrappers=1:nokey=1 "$MERGED_AUDIO_FILE" 2>/dev/null || echo "")
+            if [[ "$AUDIO_DURATION" =~ ^[0-9.]+$ ]] && awk -v d="$AUDIO_DURATION" 'BEGIN{exit !(d>0)}'; then
+                echo "Merged audio duration: ${AUDIO_DURATION}s — playback position will stay continuous across video/bumper cuts and loop forever once it reaches the end."
+            else
+                echo "WARNING: could not probe merged audio duration — audio will still loop forever, but position continuity across cuts is disabled (it will restart from 0 on every video/bumper change)."
+                AUDIO_DURATION=""
+            fi
         else
             echo "WARNING: failed to merge background audio tracks (bad URL, unreachable, or undecodable format?) — stream will be silent."
         fi
     fi
 fi
-if [ "${#AUDIO_INPUT_ARGS[@]}" -eq 0 ]; then
-    echo "NOTICE: BACKGROUND_AUDIO_URL not set — stream will be silent (source video audio is always muted)."
-    AUDIO_INPUT_ARGS=(-f lavfi -i "anullsrc=r=48000:cl=stereo")
+if [ "$AUDIO_MODE" != "merged" ]; then
+    AUDIO_MODE="silent"
+    echo "NOTICE: no usable background audio configured — stream will be silent (source video audio is always muted)."
 fi
 
 # Subscriber count + live viewer count are optional — if the API creds
@@ -146,8 +151,9 @@ SUB_ICON_R=20
 # Real wall-clock start of the whole broadcast (not any single video).
 # Each video runs as its own ffmpeg process, so `t` resets to 0 every
 # time — anything that needs to stay in sync across video boundaries
-# (like the poll/info panel switch below) has to add this offset back
-# in rather than relying on `t` alone. See VIDEO_START_OFFSET in
+# (like the poll/info panel switch below, and the background-audio seek
+# position computed by get_audio_input_args()) has to add this offset
+# back in rather than relying on `t` alone. See VIDEO_START_OFFSET in
 # run_video().
 STREAM_START_EPOCH=$(date +%s)
 
@@ -597,6 +603,45 @@ DEFAULT_FACTS=(
     "In 2022, the Event Horizon Telescope revealed the first image of Sagittarius A*, the black hole at the center of our galaxy."
     "The search for potentially habitable exoplanets is one of the major goals of modern astronomy."
 )
+
+#############################################
+# get_audio_input_args: (re)computes the global
+# AUDIO_INPUT_ARGS array immediately before every
+# ffmpeg invocation (video and bumper alike).
+#
+# Why this exists: each video and each up-next
+# bumper runs as its own separate ffmpeg process.
+# If we just pass "-stream_loop -1 -i merged.m4a"
+# every time, the audio silently jumps back to
+# 0:00 on every single cut. Instead, this computes
+# how many real wall-clock seconds have elapsed
+# since STREAM_START_EPOCH, wraps that against the
+# probed duration of the merged track (AUDIO_DURATION),
+# and seeks the audio input to that position before
+# handing off to the next ffmpeg process — so the
+# track keeps advancing continuously through its
+# full length regardless of how the video/bumper
+# rotation is going, and loops back to 0:00 and
+# starts again forever once it reaches the end.
+#
+# If AUDIO_DURATION couldn't be probed (rare), we
+# fall back to looping from 0 every time — audio
+# still loops forever, it just won't stay
+# continuous across cuts.
+#############################################
+get_audio_input_args() {
+    if [ "$AUDIO_MODE" = "merged" ] && [ -n "$AUDIO_DURATION" ]; then
+        local now elapsed seek
+        now=$(date +%s)
+        elapsed=$((now - STREAM_START_EPOCH))
+        seek=$(awk -v e="$elapsed" -v d="$AUDIO_DURATION" 'BEGIN{m = e - d*int(e/d); if (m < 0) m = 0; printf "%.3f", m}')
+        AUDIO_INPUT_ARGS=(-ss "$seek" -stream_loop -1 -i "$MERGED_AUDIO_FILE")
+    elif [ "$AUDIO_MODE" = "merged" ]; then
+        AUDIO_INPUT_ARGS=(-stream_loop -1 -i "$MERGED_AUDIO_FILE")
+    else
+        AUDIO_INPUT_ARGS=(-f lavfi -i "anullsrc=r=48000:cl=stereo")
+    fi
+}
 
 #############################################
 # build_labels_chain: optional feature — draws
@@ -1251,6 +1296,11 @@ run_bumper() {
     BFILTER+="[bc7]drawbox=x=1262:y=636:w=2:h=34:color=${GOLD}@0.5:t=fill[bc8];"
     BFILTER+="[bc8]fade=t=in:st=0:d=0.5,fade=t=out:st=${fade_out_start}:d=0.6[final]"
 
+    # Recompute the audio input args right before this bumper's ffmpeg
+    # invocation, so the background track keeps advancing from its real
+    # current position instead of jumping back to 0:00 for the bumper.
+    get_audio_input_args
+
     ffmpeg \
     -hide_banner \
     -loglevel warning \
@@ -1325,6 +1375,12 @@ run_video() {
         echo "Streaming (attempt ${attempt}/${MAX_RETRIES}):"
         echo "$url"
         echo "----------------------------------------"
+
+        # Recompute the audio input args right before every attempt
+        # (including retries), so the background track's seek position
+        # always reflects the current real elapsed time rather than
+        # whatever it was when run_video() first started.
+        get_audio_input_args
 
         set +e
         ffmpeg \
