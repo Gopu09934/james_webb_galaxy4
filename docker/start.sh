@@ -396,6 +396,14 @@ POLL_PID=""
     LIVE_CHAT_ID=""
     NEXT_PAGE_TOKEN=""
     CHAT_POLL_INTERVAL=10
+    WARNED_NO_STATS=false
+    WARNED_NO_VIDEO_ID=false
+    WARNED_NO_CHAT_ID=false
+
+    if [ "$SHOW_STATS" != true ]; then
+        echo "NOTICE: [poll] YOUTUBE_API_KEY/YOUTUBE_CHANNEL_ID not set — vote tallying is disabled. The question will still rotate, but bars will stay at 0%."
+        WARNED_NO_STATS=true
+    fi
 
     while true; do
         NOW=$(date +%s)
@@ -422,9 +430,22 @@ POLL_PID=""
             if [ -z "$LIVE_CHAT_ID" ]; then
                 VIDEO_ID=""
                 [ -f "$ASSET_DIR/live_video_id.txt" ] && VIDEO_ID="$(cat "$ASSET_DIR/live_video_id.txt" 2>/dev/null)"
-                if [ -n "$VIDEO_ID" ]; then
+                if [ -z "$VIDEO_ID" ]; then
+                    if [ "$WARNED_NO_VIDEO_ID" != true ]; then
+                        echo "NOTICE: [poll] Waiting for the live broadcast to be found (no live_video_id.txt yet). This needs the stream to be live AND public — voting can't start until then."
+                        WARNED_NO_VIDEO_ID=true
+                    fi
+                else
+                    WARNED_NO_VIDEO_ID=false
                     VRESP=$(curl -s "https://www.googleapis.com/youtube/v3/videos?part=liveStreamingDetails&id=${VIDEO_ID}&key=${YOUTUBE_API_KEY}" || true)
                     LIVE_CHAT_ID=$(echo "$VRESP" | grep -o '"activeLiveChatId": *"[^"]*"' | head -1 | sed -E 's/.*"activeLiveChatId": *"([^"]*)".*/\1/')
+                    if [ -n "$LIVE_CHAT_ID" ]; then
+                        echo "NOTICE: [poll] Found live chat for video ${VIDEO_ID} — vote tallying is now active."
+                        WARNED_NO_CHAT_ID=false
+                    elif [ "$WARNED_NO_CHAT_ID" != true ]; then
+                        echo "WARNING: [poll] Found live video ${VIDEO_ID} but no activeLiveChatId in the response — is live chat enabled for this broadcast? (Members-only or replay chat can also cause this.)"
+                        WARNED_NO_CHAT_ID=true
+                    fi
                 fi
             fi
 
@@ -436,6 +457,12 @@ POLL_PID=""
                 if [ -z "$CRESP" ] || ! echo "$CRESP" | grep -q '"pollingIntervalMillis"'; then
                     # Chat lookup failed (broadcast/chat ended, bad id,
                     # etc.) — clear and let the next loop re-resolve it.
+                    ERR_MSG=$(echo "$CRESP" | grep -o '"message": *"[^"]*"' | head -1 | sed -E 's/.*"message": *"([^"]*)".*/\1/')
+                    if [ -n "$ERR_MSG" ]; then
+                        echo "WARNING: [poll] Chat lookup failed: ${ERR_MSG}"
+                    else
+                        echo "WARNING: [poll] Chat lookup failed (empty or unexpected response) — will retry."
+                    fi
                     LIVE_CHAT_ID=""
                     NEXT_PAGE_TOKEN=""
                 else
@@ -444,13 +471,29 @@ POLL_PID=""
                     if [ -n "$NEW_INTERVAL" ] && [ "$NEW_INTERVAL" -ge 5000 ]; then
                         CHAT_POLL_INTERVAL=$(( NEW_INTERVAL / 1000 ))
                     fi
+                    NEW_MSG_COUNT=0
+                    NEW_VOTE_COUNT=0
                     while IFS= read -r MSG; do
+                        [ -z "$MSG" ] && continue
+                        NEW_MSG_COUNT=$((NEW_MSG_COUNT + 1))
                         NORM=$(echo "$MSG" | tr '[:upper:]' '[:lower:]' | tr -d '[:space:]')
                         case "$NORM" in
-                            '!vote1') VOTES1=$((VOTES1 + 1)) ;;
-                            '!vote2') VOTES2=$((VOTES2 + 1)) ;;
+                            '!vote1')
+                                VOTES1=$((VOTES1 + 1))
+                                NEW_VOTE_COUNT=$((NEW_VOTE_COUNT + 1))
+                                echo "NOTICE: [poll] Vote counted for option 1 (running total: ${VOTES1} vs ${VOTES2})"
+                                ;;
+                            '!vote2')
+                                VOTES2=$((VOTES2 + 1))
+                                NEW_VOTE_COUNT=$((NEW_VOTE_COUNT + 1))
+                                echo "NOTICE: [poll] Vote counted for option 2 (running total: ${VOTES1} vs ${VOTES2})"
+                                ;;
                         esac
                     done < <(echo "$CRESP" | grep -o '"displayMessage": *"[^"]*"' | sed -E 's/.*"displayMessage": *"([^"]*)".*/\1/')
+
+                    if [ "$NEW_MSG_COUNT" -gt 0 ] && [ "$NEW_VOTE_COUNT" -eq 0 ]; then
+                        echo "NOTICE: [poll] Saw ${NEW_MSG_COUNT} new chat message(s) this round — none matched '!vote 1' / '!vote 2' exactly."
+                    fi
 
                     TOTAL=$((VOTES1 + VOTES2))
                     if [ "$TOTAL" -gt 0 ]; then
