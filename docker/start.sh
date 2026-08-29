@@ -17,25 +17,43 @@ fi
 # Background audio (replaces the source video's
 # own audio entirely — the video is always
 # muted). BACKGROUND_AUDIO_URL is a comma-
-# separated list of one or more audio URLs
-# (same convention as VIDEO_URL), played back to
-# back and looped forever via ffmpeg's concat
-# demuxer + -stream_loop -1. Optional: if unset,
-# the stream is simply silent instead of using
-# the source video's audio.
+# separated list of one or more audio URLs (same
+# convention as VIDEO_URL, any format ffmpeg can
+# decode — mp3, m4a/aac, wav, etc., and formats
+# can be mixed across tracks). Optional: if
+# unset, the stream is simply silent instead of
+# using the source video's audio.
+#
+# All tracks are merged into a single local file
+# ONCE at startup (via the concat *filter*, not
+# the concat *demuxer* — the filter decodes each
+# input independently before joining, so it
+# doesn't care if tracks are different formats;
+# the demuxer expects matching codec parameters
+# across files and can corrupt playback when they
+# differ). That merged file is then looped with
+# -stream_loop -1 for every video.
+#
+# This two-step approach exists because looping a
+# *multi-file* concat playlist directly turned out
+# to be unreliable in testing — it decodes fine
+# for the first pass but throws demux errors and
+# cuts the audio short on the loop-back, regardless
+# of format (confirmed with both matching and
+# mixed-format playlists). Looping a single merged
+# file doesn't have that problem.
 #
 # Note on continuity: each video runs as its own
-# ffmpeg process (see run_video()), so the audio
-# playlist restarts from the top of the list
-# every time a new video begins — it loops
-# continuously *within* a video, but isn't
-# phase-continuous across video cuts. Given the
-# visuals already cut at that point too, this is
-# a reasonable trade for the added complexity a
-# fully seamless cross-process audio pipeline
-# would need.
+# ffmpeg process (see run_video()), so playback
+# restarts from the top of the merged track every
+# time a new video begins — it loops continuously
+# *within* a video, but isn't phase-continuous
+# across video cuts. Given the visuals already cut
+# at that point too, this is a reasonable trade for
+# the added complexity a fully seamless cross-
+# process audio pipeline would need.
 #############################################
-AUDIO_PLAYLIST_FILE="audio_playlist.txt"
+MERGED_AUDIO_FILE="background_audio_merged.m4a"
 AUDIO_INPUT_ARGS=()
 if [ -n "${BACKGROUND_AUDIO_URL:-}" ]; then
     IFS=',' read -ra RAW_AUDIO_URLS <<< "$BACKGROUND_AUDIO_URL"
@@ -48,18 +66,25 @@ if [ -n "${BACKGROUND_AUDIO_URL:-}" ]; then
     if [ "${#AUDIO_URLS[@]}" -eq 0 ]; then
         echo "NOTICE: BACKGROUND_AUDIO_URL was set but contained no valid entries — stream will be silent."
     else
-        : > "$AUDIO_PLAYLIST_FILE"
-        for u in "${AUDIO_URLS[@]}"; do
-            # Escape single quotes for the concat demuxer's quoted
-            # 'file' entries (harmless no-op for URLs without any).
-            esc="${u//\'/\'\\\'\'}"
-            printf "file '%s'\n" "$esc" >> "$AUDIO_PLAYLIST_FILE"
-        done
-        echo "Background audio playlist (${#AUDIO_URLS[@]} track(s), looping):"
+        echo "Merging ${#AUDIO_URLS[@]} background audio track(s) into a single local loop file:"
         for u in "${AUDIO_URLS[@]}"; do
             echo "  - $u"
         done
-        AUDIO_INPUT_ARGS=(-protocol_whitelist file,http,https,tcp,tls,crypto -stream_loop -1 -f concat -safe 0 -i "$AUDIO_PLAYLIST_FILE")
+        MERGE_INPUTS=()
+        CONCAT_FILTER=""
+        for i in "${!AUDIO_URLS[@]}"; do
+            MERGE_INPUTS+=(-i "${AUDIO_URLS[$i]}")
+            CONCAT_FILTER+="[${i}:a]"
+        done
+        CONCAT_FILTER+="concat=n=${#AUDIO_URLS[@]}:v=0:a=1[aout]"
+        if ffmpeg -hide_banner -loglevel error -y "${MERGE_INPUTS[@]}" \
+            -filter_complex "$CONCAT_FILTER" -map "[aout]" \
+            -c:a aac -b:a 192k "$MERGED_AUDIO_FILE"; then
+            echo "Background audio merged successfully -> $MERGED_AUDIO_FILE"
+            AUDIO_INPUT_ARGS=(-stream_loop -1 -i "$MERGED_AUDIO_FILE")
+        else
+            echo "WARNING: failed to merge background audio tracks (bad URL, unreachable, or undecodable format?) — stream will be silent."
+        fi
     fi
 fi
 if [ "${#AUDIO_INPUT_ARGS[@]}" -eq 0 ]; then
