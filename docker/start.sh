@@ -14,84 +14,183 @@ if [ -z "${YOUTUBE_STREAM_KEY:-}" ]; then
 fi
 
 #############################################
-# Background audio (replaces the source video's
-# own audio entirely — the video is always
-# muted). BACKGROUND_AUDIO_URL is a comma-
-# separated list of one or more audio URLs (same
-# convention as VIDEO_URL, any format ffmpeg can
-# decode — mp3, m4a/aac, wav, etc., and formats
-# can be mixed across tracks). Optional: if
-# unset, the stream is simply silent instead of
-# using the source video's audio.
+# Background audio (replaces the source video's own
+# audio entirely — the video is always muted).
 #
-# All tracks are merged into a single local file
-# ONCE at startup (via the concat *filter*, not
-# the concat *demuxer* — the filter decodes each
-# input independently before joining, so it
-# doesn't care if tracks are different formats;
-# the demuxer expects matching codec parameters
-# across files and can corrupt playback when they
-# differ). That merged file is then looped with
-# -stream_loop -1 for every video.
+# Two independent, optional sources:
+#   BACKGROUND_AUDIO_URL — your narration/voice track(s)
+#   MUSIC_URL             — a lofi/music bed track(s)
+# Both are comma-separated lists (same convention as
+# VIDEO_URL), any format ffmpeg can decode, formats can
+# be mixed within a list.
 #
-# Continuity across video/bumper cuts: each video
-# (and each up-next bumper) runs as its own ffmpeg
-# process, so naively looping the merged file from
-# its start every time would reset the background
-# audio to position 0 on every cut. Instead,
-# get_audio_input_args() (defined further down)
-# computes how many seconds of real wall-clock time
-# have elapsed since the broadcast started, wraps
-# that against the merged track's probed duration,
-# and seeks the audio input to that position before
-# every ffmpeg invocation — so the track plays
-# through in full, loops forever once it reaches the
-# end, and never resets just because the video (or a
-# bumper) changed underneath it.
+# When BOTH are set, they're combined into a repeating
+# "documentary rhythm" programme, built once at startup:
+#
+#   [VOICE_SEGMENT_SEC sec of narration, music ducked low underneath]
+#   -> [MUSIC_SEGMENT_SEC sec of music alone, narration silent]
+#   -> repeat, for as many cycles as it takes to play the
+#      narration through once (then the whole programme
+#      loops forever, same as before).
+#
+# Music always keeps running under the narration (just
+# quieter, at MUSIC_DUCK_LEVEL) rather than cutting out —
+# only the "break" segment brings it up to full volume.
+# Short crossfades (AUDIO_RAMP_SEC) smooth every transition
+# so there's no audible click/pop at the cut points.
+#
+# Fallbacks: narration only -> loops solo, unchanged from
+# before. Music only -> loops solo as an ambient bed.
+# Neither -> silent.
+#
+# All merging/mixing happens ONCE at startup via ffmpeg's
+# concat *filter* (not the concat *demuxer* — the filter
+# decodes each input independently before joining, so it
+# doesn't care if tracks are different formats; the demuxer
+# expects matching codec parameters and can corrupt playback
+# when they differ).
+#
+# Continuity across video/bumper cuts: each video (and each
+# up-next bumper) runs as its own ffmpeg process, so naively
+# looping the built audio file from its start every time
+# would reset it to position 0 on every cut. Instead,
+# get_audio_input_args() (defined further down) computes how
+# many seconds of real wall-clock time have elapsed since the
+# broadcast started, wraps that against the file's probed
+# duration, and seeks to that position before every ffmpeg
+# invocation — so playback advances continuously and only
+# loops back to the start once it's actually played all the
+# way through, regardless of how the video/bumper rotation is
+# going underneath it.
 #############################################
-MERGED_AUDIO_FILE="background_audio_merged.m4a"
+MERGED_VOICE_FILE="voice_merged.m4a"
+MERGED_MUSIC_FILE="music_merged.m4a"
+MERGED_PROGRAMME_FILE="programme_merged.m4a"
+MERGED_AUDIO_FILE=""   # set below to whichever file get_audio_input_args() should loop
 AUDIO_INPUT_ARGS=()
-AUDIO_MODE="silent"   # "silent" or "merged" — read by get_audio_input_args()
-AUDIO_DURATION=""     # probed duration (seconds) of MERGED_AUDIO_FILE, if available
-if [ -n "${BACKGROUND_AUDIO_URL:-}" ]; then
-    IFS=',' read -ra RAW_AUDIO_URLS <<< "$BACKGROUND_AUDIO_URL"
-    AUDIO_URLS=()
-    for u in "${RAW_AUDIO_URLS[@]}"; do
+AUDIO_MODE="silent"    # "silent" or "merged" — read by get_audio_input_args()
+AUDIO_DURATION=""      # probed duration (seconds) of MERGED_AUDIO_FILE, if available
+
+# Documentary-rhythm tuning knobs (override via env vars if you like)
+VOICE_SEGMENT_SEC="${VOICE_SEGMENT_SEC:-40}"    # seconds of narration per cycle
+MUSIC_SEGMENT_SEC="${MUSIC_SEGMENT_SEC:-15}"    # seconds of music-alone per cycle
+MUSIC_DUCK_LEVEL="${MUSIC_DUCK_LEVEL:-0.18}"    # music volume (0-1) while narration plays
+AUDIO_RAMP_SEC="${AUDIO_RAMP_SEC:-0.4}"         # crossfade length (sec) at each transition
+
+# Merges a comma-separated list of audio URLs into a single local
+# file via the concat filter. Echoes nothing; returns 0/1.
+merge_audio_urls() {
+    local url_list="$1" out_file="$2" label="$3"
+    local raw=() urls=()
+    IFS=',' read -ra raw <<< "$url_list"
+    for u in "${raw[@]}"; do
         u="${u#"${u%%[![:space:]]*}"}"
         u="${u%"${u##*[![:space:]]}"}"
-        [ -n "$u" ] && AUDIO_URLS+=("$u")
+        [ -n "$u" ] && urls+=("$u")
     done
-    if [ "${#AUDIO_URLS[@]}" -eq 0 ]; then
-        echo "NOTICE: BACKGROUND_AUDIO_URL was set but contained no valid entries — stream will be silent."
+    if [ "${#urls[@]}" -eq 0 ]; then
+        echo "NOTICE: ${label} URL list was set but contained no valid entries."
+        return 1
+    fi
+    echo "Merging ${#urls[@]} ${label} track(s) into a single local loop file:"
+    for u in "${urls[@]}"; do
+        echo "  - $u"
+    done
+    local merge_inputs=() concat_filter=""
+    for i in "${!urls[@]}"; do
+        merge_inputs+=(-i "${urls[$i]}")
+        concat_filter+="[${i}:a]"
+    done
+    concat_filter+="concat=n=${#urls[@]}:v=0:a=1[aout]"
+    if ffmpeg -hide_banner -loglevel error -y "${merge_inputs[@]}" \
+        -filter_complex "$concat_filter" -map "[aout]" \
+        -c:a aac -b:a 192k "$out_file"; then
+        echo "${label} merged successfully -> $out_file"
+        return 0
     else
-        echo "Merging ${#AUDIO_URLS[@]} background audio track(s) into a single local loop file:"
-        for u in "${AUDIO_URLS[@]}"; do
-            echo "  - $u"
-        done
-        MERGE_INPUTS=()
-        CONCAT_FILTER=""
-        for i in "${!AUDIO_URLS[@]}"; do
-            MERGE_INPUTS+=(-i "${AUDIO_URLS[$i]}")
-            CONCAT_FILTER+="[${i}:a]"
-        done
-        CONCAT_FILTER+="concat=n=${#AUDIO_URLS[@]}:v=0:a=1[aout]"
-        if ffmpeg -hide_banner -loglevel error -y "${MERGE_INPUTS[@]}" \
-            -filter_complex "$CONCAT_FILTER" -map "[aout]" \
-            -c:a aac -b:a 192k "$MERGED_AUDIO_FILE"; then
-            echo "Background audio merged successfully -> $MERGED_AUDIO_FILE"
+        echo "WARNING: failed to merge ${label} tracks (bad URL, unreachable, or undecodable format?)."
+        return 1
+    fi
+}
+
+probe_duration() {
+    local f="$1" d
+    d=$(ffprobe -v error -show_entries format=duration -of default=noprint_wrappers=1:nokey=1 "$f" 2>/dev/null || echo "")
+    d=${d%.*}
+    [[ "$d" =~ ^[0-9]+$ ]] && [ "$d" -gt 0 ] && echo "$d" || echo ""
+}
+
+HAVE_VOICE=false
+HAVE_MUSIC=false
+[ -n "${BACKGROUND_AUDIO_URL:-}" ] && merge_audio_urls "$BACKGROUND_AUDIO_URL" "$MERGED_VOICE_FILE" "narration" && HAVE_VOICE=true
+[ -n "${MUSIC_URL:-}" ] && merge_audio_urls "$MUSIC_URL" "$MERGED_MUSIC_FILE" "music" && HAVE_MUSIC=true
+
+if [ "$HAVE_VOICE" = true ] && [ "$HAVE_MUSIC" = true ]; then
+    VOICE_DURATION=$(probe_duration "$MERGED_VOICE_FILE")
+    if [ -n "$VOICE_DURATION" ]; then
+        CYCLE_SEC=$((VOICE_SEGMENT_SEC + MUSIC_SEGMENT_SEC))
+        N_CHUNKS=$(( (VOICE_DURATION + VOICE_SEGMENT_SEC - 1) / VOICE_SEGMENT_SEC ))
+        [ "$N_CHUNKS" -lt 1 ] && N_CHUNKS=1
+        TOTAL_SEC=$((N_CHUNKS * CYCLE_SEC))
+
+        # Narration volume: full during the voice window, ramps down to
+        # 0 just before the break, silent through the break, ramps back
+        # up to full right as the next voice window begins.
+        VOICE_ENV="if(lt(mod(t\,${CYCLE_SEC})\,${VOICE_SEGMENT_SEC}-${AUDIO_RAMP_SEC})\,1\,if(lt(mod(t\,${CYCLE_SEC})\,${VOICE_SEGMENT_SEC})\,(${VOICE_SEGMENT_SEC}-mod(t\,${CYCLE_SEC}))/${AUDIO_RAMP_SEC}\,if(lt(mod(t\,${CYCLE_SEC})\,${CYCLE_SEC}-${AUDIO_RAMP_SEC})\,0\,(mod(t\,${CYCLE_SEC})-(${CYCLE_SEC}-${AUDIO_RAMP_SEC}))/${AUDIO_RAMP_SEC})))"
+
+        # Music volume: ducked to MUSIC_DUCK_LEVEL during the voice
+        # window (so it's always audibly running underneath, just
+        # quiet), swells to full for the break, ducks back down as the
+        # next voice window begins.
+        MUSIC_ENV="if(lt(mod(t\,${CYCLE_SEC})\,${VOICE_SEGMENT_SEC}-${AUDIO_RAMP_SEC})\,${MUSIC_DUCK_LEVEL}\,if(lt(mod(t\,${CYCLE_SEC})\,${VOICE_SEGMENT_SEC})\,${MUSIC_DUCK_LEVEL}+(1-${MUSIC_DUCK_LEVEL})*(mod(t\,${CYCLE_SEC})-(${VOICE_SEGMENT_SEC}-${AUDIO_RAMP_SEC}))/${AUDIO_RAMP_SEC}\,if(lt(mod(t\,${CYCLE_SEC})\,${CYCLE_SEC}-${AUDIO_RAMP_SEC})\,1\,1-(1-${MUSIC_DUCK_LEVEL})*(mod(t\,${CYCLE_SEC})-(${CYCLE_SEC}-${AUDIO_RAMP_SEC}))/${AUDIO_RAMP_SEC})))"
+
+        PROGRAMME_FILTER="[0:a]atrim=0:${TOTAL_SEC},asetpts=PTS-STARTPTS,volume=eval=frame:volume='${VOICE_ENV}'[voice];"
+        PROGRAMME_FILTER+="[1:a]atrim=0:${TOTAL_SEC},asetpts=PTS-STARTPTS,volume=eval=frame:volume='${MUSIC_ENV}'[music];"
+        PROGRAMME_FILTER+="[voice][music]amix=inputs=2:duration=first:normalize=0[aout]"
+
+        echo "Building documentary-rhythm programme: ${VOICE_SEGMENT_SEC}s narration (music ducked to ${MUSIC_DUCK_LEVEL}) + ${MUSIC_SEGMENT_SEC}s music alone, x${N_CHUNKS} cycle(s) = ${TOTAL_SEC}s total."
+
+        # Both source files are looped as inputs (-stream_loop -1) purely
+        # so neither can underflow while this renders; the -t on the
+        # output is what actually caps the programme at TOTAL_SEC.
+        if ffmpeg -hide_banner -loglevel error -y \
+            -stream_loop -1 -i "$MERGED_VOICE_FILE" \
+            -stream_loop -1 -i "$MERGED_MUSIC_FILE" \
+            -filter_complex "$PROGRAMME_FILTER" -map "[aout]" \
+            -c:a aac -b:a 192k -t "$TOTAL_SEC" "$MERGED_PROGRAMME_FILE"; then
+            echo "Programme built successfully -> $MERGED_PROGRAMME_FILE"
             AUDIO_MODE="merged"
-            AUDIO_DURATION=$(ffprobe -v error -show_entries format=duration -of default=noprint_wrappers=1:nokey=1 "$MERGED_AUDIO_FILE" 2>/dev/null || echo "")
-            if [[ "$AUDIO_DURATION" =~ ^[0-9.]+$ ]] && awk -v d="$AUDIO_DURATION" 'BEGIN{exit !(d>0)}'; then
-                echo "Merged audio duration: ${AUDIO_DURATION}s — playback position will stay continuous across video/bumper cuts and loop forever once it reaches the end."
+            MERGED_AUDIO_FILE="$MERGED_PROGRAMME_FILE"
+            AUDIO_DURATION=$(probe_duration "$MERGED_PROGRAMME_FILE")
+            if [ -n "$AUDIO_DURATION" ]; then
+                echo "Programme duration: ${AUDIO_DURATION}s — playback position will stay continuous across video/bumper cuts and loop forever once it reaches the end."
             else
-                echo "WARNING: could not probe merged audio duration — audio will still loop forever, but position continuity across cuts is disabled (it will restart from 0 on every video/bumper change)."
-                AUDIO_DURATION=""
+                echo "WARNING: could not probe the built programme's duration — position continuity across cuts is disabled."
             fi
         else
-            echo "WARNING: failed to merge background audio tracks (bad URL, unreachable, or undecodable format?) — stream will be silent."
+            echo "WARNING: failed to build the voice/music programme — falling back to narration only, looped solo."
+            AUDIO_MODE="merged"
+            MERGED_AUDIO_FILE="$MERGED_VOICE_FILE"
+            AUDIO_DURATION="$VOICE_DURATION"
         fi
+    else
+        echo "WARNING: could not probe narration duration — falling back to narration only, looped solo (no rhythm/ducking)."
+        AUDIO_MODE="merged"
+        MERGED_AUDIO_FILE="$MERGED_VOICE_FILE"
+        AUDIO_DURATION=""
     fi
+elif [ "$HAVE_VOICE" = true ]; then
+    echo "NOTICE: MUSIC_URL not set — narration will loop solo with no music bed."
+    AUDIO_MODE="merged"
+    MERGED_AUDIO_FILE="$MERGED_VOICE_FILE"
+    AUDIO_DURATION=$(probe_duration "$MERGED_VOICE_FILE")
+elif [ "$HAVE_MUSIC" = true ]; then
+    echo "NOTICE: BACKGROUND_AUDIO_URL not set — music will loop solo as an ambient bed (no narration)."
+    AUDIO_MODE="merged"
+    MERGED_AUDIO_FILE="$MERGED_MUSIC_FILE"
+    AUDIO_DURATION=$(probe_duration "$MERGED_MUSIC_FILE")
 fi
+
 if [ "$AUDIO_MODE" != "merged" ]; then
     AUDIO_MODE="silent"
     echo "NOTICE: no usable background audio configured — stream will be silent (source video audio is always muted)."
