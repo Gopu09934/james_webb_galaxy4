@@ -1,4 +1,4 @@
-430,120,Deep Field
-700,240,Ancient Galaxy
-920,350,Emission Region
-1060,510,Cosmic Structure
+450,140,Ancient Stars
+690,230,Stellar Population
+910,360,Galactic Core
+1040,520,Nebula Region
