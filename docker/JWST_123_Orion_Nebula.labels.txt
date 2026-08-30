@@ -1,4 +1,4 @@
-430,120,Deep Field
-700,240,Ancient Galaxy
-920,350,Emission Region
-1060,510,Cosmic Structure
+440,130,Galactic Arms
+680,250,Brilliant Stars
+920,370,Emission Clouds
+1060,530,Distant Light
