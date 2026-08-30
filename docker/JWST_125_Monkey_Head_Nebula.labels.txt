@@ -1,4 +1,4 @@
-430,120,Deep Field
-700,240,Ancient Galaxy
-920,350,Emission Region
-1060,510,Cosmic Structure
+470,120,Starforming Cloud
+690,240,Galaxy Cluster
+910,360,Stellar Region
+1050,520,Deep Space
