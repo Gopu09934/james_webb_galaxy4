@@ -63,8 +63,8 @@ fi
 # way through, regardless of how the video/bumper rotation is
 # going underneath it.
 #############################################
-MERGED_VOICE_FILE="voice_merged.m4a"
-MERGED_MUSIC_FILE="music_merged.m4a"
+MERGED_VOICE_FILE=""   # set below by merge_audio_urls() on success
+MERGED_MUSIC_FILE=""   # set below by merge_audio_urls() on success
 MERGED_PROGRAMME_FILE="programme_merged.m4a"
 MERGED_AUDIO_FILE=""   # set below to whichever file get_audio_input_args() should loop
 AUDIO_INPUT_ARGS=()
@@ -77,11 +77,29 @@ MUSIC_SEGMENT_SEC="${MUSIC_SEGMENT_SEC:-15}"    # seconds of music-alone per cyc
 MUSIC_DUCK_LEVEL="${MUSIC_DUCK_LEVEL:-0.18}"    # music volume (0-1) while narration plays
 AUDIO_RAMP_SEC="${AUDIO_RAMP_SEC:-0.4}"         # crossfade length (sec) at each transition
 
-# Merges a comma-separated list of audio URLs into a single local
-# file via the concat filter. Echoes nothing; returns 0/1.
+# Turns a comma-separated list of audio URLs into a single local file
+# ready to be looped, and sets MERGE_OUTPUT_FILE to its path on success.
+#
+# Single-URL case (the common one): no actual merging is needed, so
+# instead of decoding+re-encoding the whole track we just stream-copy
+# it locally (near-instant, no CPU cost — a straight byte copy of the
+# already-compressed audio). This is the single biggest lever on
+# startup time: re-encoding an hour-long track can take several
+# minutes on a CPU-constrained CI runner, while copying it takes a
+# fraction of a second. It's written into a .mka (Matroska audio)
+# container specifically because that container can hold almost any
+# audio codec without transcoding, so this works regardless of
+# whether the source is mp3, aac, wav, etc. If the copy fails for any
+# reason (e.g. an exotic codec .mka genuinely can't hold), it falls
+# back to a normal re-encode.
+#
+# Multi-URL case: these genuinely need to be joined together, which
+# requires decoding each one and re-encoding the combined result —
+# there's no way around that cost when actual mixing is happening.
 merge_audio_urls() {
-    local url_list="$1" out_file="$2" label="$3"
+    local url_list="$1" out_base="$2" label="$3"
     local raw=() urls=()
+    MERGE_OUTPUT_FILE=""
     IFS=',' read -ra raw <<< "$url_list"
     for u in "${raw[@]}"; do
         u="${u#"${u%%[![:space:]]*}"}"
@@ -92,6 +110,27 @@ merge_audio_urls() {
         echo "NOTICE: ${label} URL list was set but contained no valid entries."
         return 1
     fi
+
+    if [ "${#urls[@]}" -eq 1 ]; then
+        local copy_file="${out_base}.mka"
+        echo "Only one ${label} track — downloading it directly, no re-encode needed:"
+        echo "  - ${urls[0]}"
+        if ffmpeg -hide_banner -loglevel error -y -i "${urls[0]}" -c copy "$copy_file"; then
+            echo "${label} downloaded successfully (stream copy) -> $copy_file"
+            MERGE_OUTPUT_FILE="$copy_file"
+            return 0
+        fi
+        echo "NOTICE: stream-copy download failed for this ${label} track (unreachable, or its codec can't be copied into .mka) — retrying with a re-encode instead."
+        local reencode_file="${out_base}.m4a"
+        if ffmpeg -hide_banner -loglevel error -y -i "${urls[0]}" -c:a aac -b:a 192k "$reencode_file"; then
+            echo "${label} merged successfully -> $reencode_file"
+            MERGE_OUTPUT_FILE="$reencode_file"
+            return 0
+        fi
+        echo "WARNING: failed to process the ${label} track (bad URL, unreachable, or undecodable format?)."
+        return 1
+    fi
+
     echo "Merging ${#urls[@]} ${label} track(s) into a single local loop file:"
     for u in "${urls[@]}"; do
         echo "  - $u"
@@ -102,10 +141,12 @@ merge_audio_urls() {
         concat_filter+="[${i}:a]"
     done
     concat_filter+="concat=n=${#urls[@]}:v=0:a=1[aout]"
+    local out_file="${out_base}.m4a"
     if ffmpeg -hide_banner -loglevel error -y "${merge_inputs[@]}" \
         -filter_complex "$concat_filter" -map "[aout]" \
         -c:a aac -b:a 192k "$out_file"; then
         echo "${label} merged successfully -> $out_file"
+        MERGE_OUTPUT_FILE="$out_file"
         return 0
     else
         echo "WARNING: failed to merge ${label} tracks (bad URL, unreachable, or undecodable format?)."
@@ -122,8 +163,15 @@ probe_duration() {
 
 HAVE_VOICE=false
 HAVE_MUSIC=false
-[ -n "${BACKGROUND_AUDIO_URL:-}" ] && merge_audio_urls "$BACKGROUND_AUDIO_URL" "$MERGED_VOICE_FILE" "narration" && HAVE_VOICE=true
-[ -n "${MUSIC_URL:-}" ] && merge_audio_urls "$MUSIC_URL" "$MERGED_MUSIC_FILE" "music" && HAVE_MUSIC=true
+if [ -n "${BACKGROUND_AUDIO_URL:-}" ] && merge_audio_urls "$BACKGROUND_AUDIO_URL" "voice_merged" "narration"; then
+    MERGED_VOICE_FILE="$MERGE_OUTPUT_FILE"
+    HAVE_VOICE=true
+fi
+if [ -n "${MUSIC_URL:-}" ] && merge_audio_urls "$MUSIC_URL" "music_merged" "music"; then
+    MERGED_MUSIC_FILE="$MERGE_OUTPUT_FILE"
+    HAVE_MUSIC=true
+fi
+
 
 if [ "$HAVE_VOICE" = true ] && [ "$HAVE_MUSIC" = true ]; then
     VOICE_DURATION=$(probe_duration "$MERGED_VOICE_FILE")
