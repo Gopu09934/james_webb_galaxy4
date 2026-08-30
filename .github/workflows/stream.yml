@@ -8,7 +8,7 @@ on:
         type: boolean
         default: false
   schedule:
-   - cron: "0 */6 * * *"
+   - cron: "0 */5 * * *"
 
 concurrency:
   group: stream-job
@@ -71,4 +71,5 @@ jobs:
             -e YOUTUBE_API_KEY="${{ secrets.YOUTUBE_API_KEY }}" \
             -e YOUTUBE_CHANNEL_ID="${{ secrets.YOUTUBE_CHANNEL_ID }}" \
             -e BACKGROUND_AUDIO_URL="${{ secrets.BACKGROUND_AUDIO_URL }}" \
+            -e MUSIC_URL="${{ secrets.MUSIC_URL }}" \
             "$IMAGE:latest"
