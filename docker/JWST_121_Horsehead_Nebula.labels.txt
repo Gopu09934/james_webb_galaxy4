@@ -1,4 +1,4 @@
-430,120,Deep Field
-700,240,Ancient Galaxy
-920,350,Emission Region
-1060,510,Cosmic Structure
+430,150,Deep Universe
+670,270,Star Cluster
+900,390,Dust Clouds
+1050,550,Galaxy Core
