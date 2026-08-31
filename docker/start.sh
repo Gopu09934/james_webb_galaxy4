@@ -77,64 +77,6 @@ MUSIC_SEGMENT_SEC="${MUSIC_SEGMENT_SEC:-15}"    # seconds of music-alone per cyc
 MUSIC_DUCK_LEVEL="${MUSIC_DUCK_LEVEL:-0.18}"    # music volume (0-1) while narration plays
 AUDIO_RAMP_SEC="${AUDIO_RAMP_SEC:-0.4}"         # crossfade length (sec) at each transition
 
-#############################################
-# Studio-grade narration processing chain
-# ("cinematic voice" pass)
-#
-# Applied ONCE to the narration track only (never to
-# music) inside merge_audio_urls(), right after the
-# single-URL stream-copy / multi-URL concat produces a
-# raw local file. This mirrors the existing "do the
-# expensive work once at startup, then just loop/seek
-# the result" philosophy used everywhere else in this
-# script — no per-loop or per-video re-processing cost.
-#
-# Chain, in order:
-#   1. highpass  @ 90Hz     - remove rumble/proximity boom
-#   2. equalizer @ 150Hz    - low-shelf-ish warmth bump
-#   3. equalizer @ 400Hz    - scoop out "boxiness"
-#   4. equalizer @ 4000Hz   - presence/clarity/authority lift
-#   5. deesser              - tame harsh S/T sibilance
-#   6. acompressor          - even out dynamics, 3:1-ish
-#   7. aecho (short/quiet)  - cheap "room" reverb proxy
-#      (ffmpeg has no built-in convolution reverb without
-#      an impulse-response file, so a short, low-mix echo
-#      stands in for a light plate/room reverb — small
-#      delay, low decay, so it reads as space rather than a
-#      distinct slap-back echo)
-#   8. loudnorm              - normalize to broadcast-style
-#      -16 LUFS so narration sits at a consistent, correct
-#      level under the music mix
-#
-# Toggle: set NARRATION_STUDIO_CHAIN=false to skip this and
-# use the raw narration track unprocessed (e.g. if your
-# source audio is already professionally mixed).
-#############################################
-NARRATION_STUDIO_CHAIN="${NARRATION_STUDIO_CHAIN:-true}"
-NARRATION_FILTER="highpass=f=90,equalizer=f=150:t=q:w=1:g=3,equalizer=f=400:t=q:w=1.5:g=-3,equalizer=f=4000:t=q:w=1:g=4,deesser=i=0.15:m=0.5:f=0.5:s=o,acompressor=threshold=-18dB:ratio=3:attack=15:release=200:makeup=3,aecho=0.8:0.6:40:0.15,loudnorm=I=-16:TP=-1.5:LRA=11"
-
-# Applies the studio chain to a raw narration file and returns the
-# processed file's path via the PROCESSED_FILE global. Falls back to
-# the original (unprocessed) file if the filter pass fails for any
-# reason, so a bad/exotic input can never take the whole stream down.
-apply_narration_studio_chain() {
-    local in_file="$1"
-    PROCESSED_FILE="$in_file"
-    if [ "$NARRATION_STUDIO_CHAIN" != true ]; then
-        return 0
-    fi
-    local out_file="${in_file%.*}_studio.m4a"
-    echo "Applying studio processing to narration (EQ, de-ess, compression, reverb, loudness normalize)..."
-    if ffmpeg -hide_banner -loglevel error -y -i "$in_file" \
-        -af "$NARRATION_FILTER" \
-        -c:a aac -b:a 192k "$out_file"; then
-        echo "Narration studio pass complete -> $out_file"
-        PROCESSED_FILE="$out_file"
-    else
-        echo "WARNING: narration studio pass failed — using the unprocessed narration track instead."
-    fi
-}
-
 # Turns a comma-separated list of audio URLs into a single local file
 # ready to be looped, and sets MERGE_OUTPUT_FILE to its path on success.
 #
@@ -154,15 +96,6 @@ apply_narration_studio_chain() {
 # Multi-URL case: these genuinely need to be joined together, which
 # requires decoding each one and re-encoding the combined result —
 # there's no way around that cost when actual mixing is happening.
-#
-# NOTE: the studio processing chain above is intentionally applied
-# HERE (once, right after the raw file is produced/downloaded) rather
-# than at merge time inside the documentary-rhythm programme filter,
-# so the expensive per-sample filters (loudnorm two-pass analysis,
-# compression, etc.) only ever run once regardless of how many times
-# the resulting file gets looped/seeked over the life of the stream.
-# Only narration ("voice" label) gets the studio chain — music stays
-# untouched.
 merge_audio_urls() {
     local url_list="$1" out_base="$2" label="$3"
     local raw=() urls=()
@@ -185,10 +118,6 @@ merge_audio_urls() {
         if ffmpeg -hide_banner -loglevel error -y -i "${urls[0]}" -c copy "$copy_file"; then
             echo "${label} downloaded successfully (stream copy) -> $copy_file"
             MERGE_OUTPUT_FILE="$copy_file"
-            if [ "$label" = "narration" ]; then
-                apply_narration_studio_chain "$MERGE_OUTPUT_FILE"
-                MERGE_OUTPUT_FILE="$PROCESSED_FILE"
-            fi
             return 0
         fi
         echo "NOTICE: stream-copy download failed for this ${label} track (unreachable, or its codec can't be copied into .mka) — retrying with a re-encode instead."
@@ -196,10 +125,6 @@ merge_audio_urls() {
         if ffmpeg -hide_banner -loglevel error -y -i "${urls[0]}" -c:a aac -b:a 192k "$reencode_file"; then
             echo "${label} merged successfully -> $reencode_file"
             MERGE_OUTPUT_FILE="$reencode_file"
-            if [ "$label" = "narration" ]; then
-                apply_narration_studio_chain "$MERGE_OUTPUT_FILE"
-                MERGE_OUTPUT_FILE="$PROCESSED_FILE"
-            fi
             return 0
         fi
         echo "WARNING: failed to process the ${label} track (bad URL, unreachable, or undecodable format?)."
@@ -222,10 +147,6 @@ merge_audio_urls() {
         -c:a aac -b:a 192k "$out_file"; then
         echo "${label} merged successfully -> $out_file"
         MERGE_OUTPUT_FILE="$out_file"
-        if [ "$label" = "narration" ]; then
-            apply_narration_studio_chain "$MERGE_OUTPUT_FILE"
-            MERGE_OUTPUT_FILE="$PROCESSED_FILE"
-        fi
         return 0
     else
         echo "WARNING: failed to merge ${label} tracks (bad URL, unreachable, or undecodable format?)."
@@ -1444,7 +1365,7 @@ build_final_filter() {
     local sub_ring_x=$((SUB_ICON_X - SUB_ICON_R))
     local sub_ring_y=$((SUB_ICON_Y - SUB_ICON_R))
     local sub_ring_d=$((SUB_ICON_R * 2))
-    tail+="[wm2]drawbox=x=${sub_ring_x}:y=${sub_ring_y}:w=${sub_ring_d}:h=${sub_ring_d}:color=${GOLD}@0.9:t=3:enable='${SUB_PULSE_ENABLE}'[wm2];"
+    tail+="[wm1]drawbox=x=${sub_ring_x}:y=${sub_ring_y}:w=${sub_ring_d}:h=${sub_ring_d}:color=${GOLD}@0.9:t=3:enable='${SUB_PULSE_ENABLE}'[wm2];"
 
     # Broadcast-style corner frame brackets (thin gold L-marks inset from
     # each edge) — a classic documentary/mission-control framing touch
